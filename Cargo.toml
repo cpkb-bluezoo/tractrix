@@ -6,7 +6,9 @@ rust-version = "1.70"
 description = "Non-blocking XML push parser (Gonzalez-style)"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
+authors = ["Chris Burdess <dog@gnu.org>"]
 repository = "https://github.com/cpkb-bluezoo/tractrix"
+homepage = "https://github.com/cpkb-bluezoo/tractrix"
 keywords = ["xml", "parser", "streaming", "sax", "non-blocking"]
 categories = ["encoding", "parser-implementations"]
 # Keep the ~15MB W3C suite in git/CI, but out of the crates.io package.
