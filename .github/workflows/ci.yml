@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Library + unit tests
+        run: cargo test --lib --test unit_tests
+      - name: Docs
+        run: cargo doc --no-deps
+
+  xmlconf:
+    name: W3C xmlconf
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Conformance suite
+        run: cargo test --test xmlconf
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xml-conformance-report
+          path: target/xml-conformance-report.txt
+          if-no-files-found: ignore

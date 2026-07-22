@@ -1,0 +1,30 @@
+[package]
+name = "tractrix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Non-blocking XML push parser (Gonzalez-style)"
+readme = "README.md"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/cpkb-bluezoo/tractrix"
+keywords = ["xml", "parser", "streaming", "sax", "non-blocking"]
+categories = ["encoding", "parser-implementations"]
+# Keep the ~15MB W3C suite in git/CI, but out of the crates.io package.
+exclude = ["xmlconf/"]
+
+[lib]
+name = "tractrix"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = "1"
+encoding_rs = "0.8"
+
+[[test]]
+name = "unit_tests"
+path = "tests/unit_tests.rs"
+
+[[test]]
+name = "xmlconf"
+path = "tests/conformance/xmlconf.rs"
+harness = false
