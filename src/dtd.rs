@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! DTD model: element declarations, attribute declarations, content models,
 //! and streaming content-model validation.
 //!

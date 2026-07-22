@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Tractrix — a non-blocking, push-model XML parser.
 //!
 //! Tractrix is a Rust port of the Gonzalez streaming XML scanner. It accepts

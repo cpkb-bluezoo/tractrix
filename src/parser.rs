@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Push-parser front end wiring the decode/scan pipeline.
 //!
 //! A [`Parser`] owns an [`ExternalEntityDecoder`] (byte → char, BOM/decl

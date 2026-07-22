@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! SAX-like feature and property names / defaults.
 
 use crate::error::FeatureError;

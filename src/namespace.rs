@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Namespace processing.
 //!
 //! Ported from Gonzalez `NamespaceFilter.java` and `NamespaceScopeTracker.java`.

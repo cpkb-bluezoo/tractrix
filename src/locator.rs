@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Document location reporting.
 
 /// Locator for reporting parse position to handlers.
