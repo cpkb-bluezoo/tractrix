@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Hot-path XML scanner.
 //!
 //! Ported from Gonzalez `Scanner.java`. Recognises element start/end tags,

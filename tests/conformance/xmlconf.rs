@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! W3C XML Conformance Test Suite runner.
 //!
 //! This is a custom-harness (`harness = false`) integration test. The suite

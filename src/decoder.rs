@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Byte-to-character decoding for the scanner input pipeline.
 //!
 //! Ported from Gonzalez `BOM.java`, `ReadResult.java`, `DeclParser.java`,

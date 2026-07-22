@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Name interning pools.
 //!
 //! Ported from Gonzalez `PackedName.java` and `InternedStringPool.java`.

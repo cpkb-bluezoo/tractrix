@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Native XML event handler (Gonzalez `XMLHandler`).
 
 use crate::error::{ParseError, ParseResult};

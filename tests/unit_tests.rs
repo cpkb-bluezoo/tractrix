@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 //! Unit tests for Tractrix push-model XML parser.
 
 use bytes::Bytes;
