@@ -21,23 +21,122 @@ bytes ──▶ ExternalEntityDecoder ──▶ Scanner ──▶ (NamespaceFilt
 
 ```rust
 use bytes::Bytes;
-use tractrix::{DefaultHandler, FeatureSet, NamespaceFilter, Parser};
+use tractrix::{FeatureSet, Parser, XmlHandler};
 
-let mut app = DefaultHandler;
-let mut filter = NamespaceFilter::new(&mut app, false);
+struct CountingHandler {
+    elements: usize,
+}
+
+impl XmlHandler for CountingHandler {
+    fn start_element(&mut self, _q_name: &str) -> tractrix::ParseResult<()> {
+        self.elements += 1;
+        Ok(())
+    }
+}
+
+let mut handler = CountingHandler { elements: 0 };
 let features = FeatureSet::default();
-let mut parser = Parser::new(&mut filter, &features, None, None, None).unwrap();
+let mut parser = Parser::new(&mut handler, &features, None, None, None).unwrap();
 
-// Feed chunks as they arrive
 parser.receive(Bytes::from("<root>hel")).unwrap();
 parser.receive(Bytes::from("lo</root>")).unwrap();
-
-// Signal end-of-input
 parser.close().unwrap();
+assert_eq!(handler.elements, 1);
 
 // Reuse for another document
 parser.reset();
 parser.parse_all(Bytes::from("<doc/>")).unwrap();
+```
+
+## Writing an `XmlHandler`
+
+Implement [`XmlHandler`](src/handler.rs) on your own type. Every method has a
+default no-op (except `fatal_error`, which stops parsing), so override only
+what you care about.
+
+### Event order for an element
+
+For `<item id="42">text</item>` the handler sees, in order:
+
+1. `start_element("item")`
+2. `start_attribute("id", "CDATA", …)` then one or more
+   `attribute_value_content(…, end)` (last chunk has `end = true`)
+3. `end_attributes()` — always fired once, even with no attributes
+4. `characters(…, ignorable, end)` — text may arrive in several chunks
+5. `end_element()` — no name; keep your own stack from `start_element` if needed
+
+With a [`NamespaceFilter`](src/namespace.rs) in front, `xmlns` / `xmlns:prefix`
+become `namespace(prefix, uri)` instead of (or in addition to) attributes,
+depending on `namespace-prefixes`.
+
+### Streaming chunks and `end`
+
+Attribute values, character data, comments, and PI data are **streamed**: a
+single logical run may be one call or many. The `end` flag is true on the
+chunk that completes the run. If the first call already has `end = true`,
+you can use the slice immediately with no buffering.
+
+Text slices are borrowed from the parser’s scan buffer and are only valid
+for the duration of the callback. If you need to keep data across calls,
+copy it — and honour `save_buffers()`, which fires before the scanner reuses
+storage (e.g. after a numeric character reference or at the end of a
+`receive` chunk).
+
+### Errors
+
+- `fatal_error` — well-formedness failure; returning `Err` aborts the parse
+  (the default implementation does this).
+- `error` — recoverable (typically a DTD validity constraint when
+  `validation` is on); parsing continues unless you return `Err`.
+
+### Example: collect text under one element
+
+```rust
+use bytes::Bytes;
+use tractrix::{FeatureSet, ParseResult, Parser, XmlHandler};
+
+struct TitleCollector {
+    depth: usize,
+    in_title: bool,
+    title: String,
+}
+
+impl XmlHandler for TitleCollector {
+    fn start_element(&mut self, q_name: &str) -> ParseResult<()> {
+        self.depth += 1;
+        if q_name == "title" {
+            self.in_title = true;
+            self.title.clear();
+        }
+        Ok(())
+    }
+
+    fn characters(&mut self, text: &str, _ignorable: bool, _end: bool) -> ParseResult<()> {
+        if self.in_title {
+            self.title.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn end_element(&mut self) -> ParseResult<()> {
+        if self.in_title {
+            self.in_title = false;
+        }
+        self.depth -= 1;
+        Ok(())
+    }
+}
+
+let xml = br#"<doc><title>Hello &amp; world</title></doc>"#;
+let mut handler = TitleCollector {
+    depth: 0,
+    in_title: false,
+    title: String::new(),
+};
+let features = FeatureSet::default();
+let mut parser = Parser::new(&mut handler, &features, None, None, None).unwrap();
+parser.parse_all(Bytes::from_static(xml)).unwrap();
+assert_eq!(handler.title, "Hello & world");
 ```
 
 ## Features
