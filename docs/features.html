@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Features — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html" aria-current="page">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Features</h1>
+        <p class="lead">Runtime FeatureSet — not Cargo feature flags.</p>
+      </header>
+
+      <p>
+        Configure a <code>FeatureSet</code> before constructing
+        <code>Parser</code>. Field defaults match Gonzalez’s secure SAX-like
+        defaults. You can also use SAX feature URI strings via
+        <code>get_feature</code> / <code>set_feature</code>.
+      </p>
+
+      <h2 id="table">Defaults</h2>
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>namespaces</code></td><td>on</td><td>Expect namespace-aware pipeline (use with <code>NamespaceFilter</code>)</td></tr>
+          <tr><td><code>namespace_prefixes</code></td><td>off</td><td>Also report xmlns as attributes</td></tr>
+          <tr><td><code>validation</code></td><td>off</td><td>DTD validation (models, attribute types, ID/IDREF, …)</td></tr>
+          <tr><td><code>external_general_entities</code></td><td><strong>off</strong></td><td>Load external general entities</td></tr>
+          <tr><td><code>external_parameter_entities</code></td><td><strong>off</strong></td><td>Load external parameter entities</td></tr>
+          <tr><td><code>disallow_doctype_decl</code></td><td>off</td><td>Reject any DOCTYPE</td></tr>
+          <tr><td><code>access_external_dtd</code></td><td><code>""</code></td><td>Protocol allow-list (<code>"file"</code>, <code>"all"</code>, …)</td></tr>
+          <tr><td><code>entity_expansion_limit</code></td><td>64000</td><td>Max expansions per document</td></tr>
+          <tr><td><code>resolve_dtd_uris</code></td><td>on</td><td>Resolve relative system IDs</td></tr>
+          <tr><td><code>string_interning</code></td><td>on</td><td>Intern element/attribute names</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="example">Example</h2>
+      <pre><code>use tractrix::FeatureSet;
+
+let mut f = FeatureSet::default();
+f.validation = true;
+f.external_general_entities = true;
+f.access_external_dtd = "file".to_string();</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Mid-parse changes</strong></p>
+        <p>
+          Once parsing has started, changing <code>namespaces</code> or
+          <code>validation</code> via <code>set_feature</code> is rejected.
+          Prefer a fresh <code>FeatureSet</code> and <code>Parser::new</code>
+          (or <code>reset</code> after reconfiguration as appropriate).
+        </p>
+      </div>
+
+      <h2 id="uris">Feature URIs</h2>
+      <p>
+        Constants such as <code>FEATURE_NAMESPACES</code>,
+        <code>FEATURE_VALIDATION</code>,
+        <code>FEATURE_EXTERNAL_GENERAL_ENTITIES</code>,
+        <code>FEATURE_SECURE_PROCESSING</code>, and properties
+        <code>PROPERTY_ACCESS_EXTERNAL_DTD</code> /
+        <code>PROPERTY_ENTITY_EXPANSION_LIMIT</code> are defined in the
+        <code>features</code> module for SAX-style configuration.
+      </p>
+      <p>
+        <code>FEATURE_SECURE_PROCESSING</code> reports true when both
+        external-entity features are off.
+      </p>
+
+      <p class="footer">
+        <a href="security.html">Security defaults</a> ·
+        Enabling external resources requires an
+        <a href="security.html#resolvers">EntityResolver</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

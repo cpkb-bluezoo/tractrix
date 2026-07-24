@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use tractrix::{
-    EntityResolver, FeatureSet, NamespaceFilter, ParseError, ParseResult, Parser,
-    RefusingEntityResolver, XmlHandler,
+    EntityResolver, FeatureSet, IndentConfig, NamespaceFilter, OutputCharset, ParseError,
+    ParseResult, Parser, RefusingEntityResolver, XmlHandler, XmlWriter,
 };
 
 // ===== Helpers =====
@@ -718,4 +718,606 @@ fn test_dtd_internal_subset() {
     let has_dtd = h.events.iter().any(|e| e.starts_with("start_dtd:root"));
     assert!(has_dtd, "Expected DTD events; events: {:?}", h.events);
     assert!(h.events.contains(&"end_dtd".to_string()));
+}
+
+// ===== XmlWriter (ported from Gonzalez XMLWriterTest) =====
+
+fn write_xml(f: impl FnOnce(&mut XmlWriter<Vec<u8>>)) -> String {
+    let mut w = XmlWriter::new_vec();
+    f(&mut w);
+    w.flush().unwrap();
+    String::from_utf8(w.into_inner()).unwrap()
+}
+
+fn write_xml_indented(config: IndentConfig, f: impl FnOnce(&mut XmlWriter<Vec<u8>>)) -> String {
+    let mut w = XmlWriter::new_vec();
+    w.set_indent_config(Some(config));
+    f(&mut w);
+    w.flush().unwrap();
+    String::from_utf8(w.into_inner()).unwrap()
+}
+
+#[test]
+fn writer_simple_element() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root/>");
+}
+
+#[test]
+fn writer_element_with_content() {
+    let xml = write_xml(|w| {
+        w.write_start_element("greeting").unwrap();
+        w.write_characters("Hello, World!").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<greeting>Hello, World!</greeting>");
+}
+
+#[test]
+fn writer_nested_elements() {
+    let xml = write_xml(|w| {
+        w.write_start_element("parent").unwrap();
+        w.write_start_element("child").unwrap();
+        w.write_characters("text").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<parent><child>text</child></parent>");
+}
+
+#[test]
+fn writer_empty_element_optimization() {
+    let xml = write_xml(|w| {
+        w.write_start_element("container").unwrap();
+        w.write_start_element("br").unwrap();
+        w.write_end_element().unwrap();
+        w.write_start_element("hr").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<container><br/><hr/></container>");
+}
+
+#[test]
+fn writer_element_with_attribute() {
+    let xml = write_xml(|w| {
+        w.write_start_element("item").unwrap();
+        w.write_attribute("id", "123").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, r#"<item id="123"/>"#);
+}
+
+#[test]
+fn writer_element_with_multiple_attributes() {
+    let xml = write_xml(|w| {
+        w.write_start_element("person").unwrap();
+        w.write_attribute("id", "1").unwrap();
+        w.write_attribute("name", "Alice").unwrap();
+        w.write_attribute("age", "30").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, r#"<person id="1" name="Alice" age="30"/>"#);
+}
+
+#[test]
+fn writer_attribute_value_escaping() {
+    let xml = write_xml(|w| {
+        w.write_start_element("test").unwrap();
+        w.write_attribute("value", r#""quotes" & <angles>"#).unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(
+        xml,
+        r#"<test value="&quot;quotes&quot; &amp; &lt;angles&gt;"/>"#
+    );
+}
+
+#[test]
+fn writer_default_namespace() {
+    let xml = write_xml(|w| {
+        w.write_start_element_ns("http://example.com/ns", "root")
+            .unwrap();
+        w.write_default_namespace("http://example.com/ns").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, r#"<root xmlns="http://example.com/ns"/>"#);
+}
+
+#[test]
+fn writer_prefixed_namespace() {
+    let xml = write_xml(|w| {
+        w.write_start_element_prefixed("ex", "root", "http://example.com/ns")
+            .unwrap();
+        w.write_namespace("ex", "http://example.com/ns").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, r#"<ex:root xmlns:ex="http://example.com/ns"/>"#);
+}
+
+#[test]
+fn writer_mixed_namespaces() {
+    let xml = write_xml(|w| {
+        w.write_start_element_ns("http://default.com", "root")
+            .unwrap();
+        w.write_default_namespace("http://default.com").unwrap();
+        w.write_namespace("other", "http://other.com").unwrap();
+        w.write_start_element_prefixed("other", "child", "http://other.com")
+            .unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(
+        xml,
+        r#"<root xmlns="http://default.com" xmlns:other="http://other.com"><other:child/></root>"#
+    );
+}
+
+#[test]
+fn writer_namespaced_attribute() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_namespace("xlink", "http://www.w3.org/1999/xlink")
+            .unwrap();
+        w.write_attribute_prefixed(
+            "xlink",
+            "href",
+            "http://www.w3.org/1999/xlink",
+            "http://example.com",
+        )
+        .unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(
+        xml,
+        r#"<root xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="http://example.com"/>"#
+    );
+}
+
+#[test]
+fn writer_get_prefix() {
+    let mut w = XmlWriter::new_vec();
+    w.write_start_element_prefixed("ex", "root", "http://example.com")
+        .unwrap();
+    w.write_namespace("ex", "http://example.com").unwrap();
+    assert_eq!(w.get_prefix("http://example.com").as_deref(), Some("ex"));
+    assert!(w.get_prefix("http://unknown.com").is_none());
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+}
+
+#[test]
+fn writer_character_escaping() {
+    let xml = write_xml(|w| {
+        w.write_start_element("text").unwrap();
+        w.write_characters("5 < 10 & 10 > 5").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<text>5 &lt; 10 &amp; 10 &gt; 5</text>");
+}
+
+#[test]
+fn writer_utf8_characters() {
+    let xml = write_xml(|w| {
+        w.write_start_element("text").unwrap();
+        w.write_characters("Hello \u{4f60}\u{597d}").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains("Hello \u{4f60}\u{597d}"));
+}
+
+#[test]
+fn writer_cdata_section() {
+    let xml = write_xml(|w| {
+        w.write_start_element("code").unwrap();
+        w.write_start_cdata().unwrap();
+        w.write_characters("<script>alert('hello');</script>")
+            .unwrap();
+        w.write_end_cdata().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(
+        xml,
+        "<code><![CDATA[<script>alert('hello');</script>]]></code>"
+    );
+}
+
+#[test]
+fn writer_comment() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_comment(" This is a comment ").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root><!-- This is a comment --></root>");
+}
+
+#[test]
+fn writer_processing_instruction() {
+    let xml = write_xml(|w| {
+        w.write_processing_instruction_data(
+            "xml-stylesheet",
+            Some(r#"type="text/xsl" href="style.xsl""#),
+        )
+        .unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(
+        xml,
+        r#"<?xml-stylesheet type="text/xsl" href="style.xsl"?><root/>"#
+    );
+}
+
+#[test]
+fn writer_processing_instruction_no_data() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_processing_instruction("page-break").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root><?page-break?></root>");
+}
+
+#[test]
+fn writer_entity_ref() {
+    let xml = write_xml(|w| {
+        w.write_start_element("text").unwrap();
+        w.write_characters("Copyright ").unwrap();
+        w.write_entity_ref("copy").unwrap();
+        w.write_characters(" 2025").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<text>Copyright &copy; 2025</text>");
+}
+
+#[test]
+fn writer_indentation_with_tabs() {
+    let xml = write_xml_indented(IndentConfig::tabs(), |w| {
+        w.write_start_element("root").unwrap();
+        w.write_start_element("child").unwrap();
+        w.write_characters("text").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root>\n\t<child>text</child>\n</root>");
+}
+
+#[test]
+fn writer_indentation_with_spaces() {
+    let xml = write_xml_indented(IndentConfig::spaces2(), |w| {
+        w.write_start_element("root").unwrap();
+        w.write_start_element("child").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root>\n  <child/>\n</root>");
+}
+
+#[test]
+fn writer_deep_nesting_indentation() {
+    let xml = write_xml_indented(IndentConfig::spaces2(), |w| {
+        w.write_start_element("a").unwrap();
+        w.write_start_element("b").unwrap();
+        w.write_start_element("c").unwrap();
+        w.write_characters("deep").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<a>\n  <b>\n    <c>deep</c>\n  </b>\n</a>");
+}
+
+#[test]
+fn writer_indentation_with_multiple_children() {
+    let xml = write_xml_indented(IndentConfig::spaces2(), |w| {
+        w.write_start_element("root").unwrap();
+        w.write_start_element("child1").unwrap();
+        w.write_end_element().unwrap();
+        w.write_start_element("child2").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root>\n  <child1/>\n  <child2/>\n</root>");
+}
+
+#[test]
+fn writer_end_element_without_start() {
+    let mut w = XmlWriter::new_vec();
+    assert!(w.write_end_element().is_err());
+}
+
+#[test]
+fn writer_large_output() {
+    let xml = write_xml(|w| {
+        w.write_start_element("items").unwrap();
+        for i in 0..1000 {
+            w.write_start_element("item").unwrap();
+            w.write_attribute("id", &i.to_string()).unwrap();
+            w.write_characters(&format!("Item number {i}")).unwrap();
+            w.write_end_element().unwrap();
+        }
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.starts_with(r#"<items><item id="0">Item number 0</item>"#));
+    assert!(xml.ends_with(r#"<item id="999">Item number 999</item></items>"#));
+}
+
+#[test]
+fn writer_doctype_with_system_id() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd(
+            "html",
+            None,
+            Some("http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"),
+        )
+        .unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("html").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains(
+        r#"<!DOCTYPE html SYSTEM "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">"#
+    ));
+    assert!(xml.contains("<html/>"));
+}
+
+#[test]
+fn writer_doctype_with_public_id() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd(
+            "html",
+            Some("-//W3C//DTD XHTML 1.0//EN"),
+            Some("http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"),
+        )
+        .unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("html").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains(
+        r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">"#
+    ));
+}
+
+#[test]
+fn writer_doctype_with_internal_subset() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd("root", None, None).unwrap();
+        w.write_element_decl("root", "(child)*").unwrap();
+        w.write_element_decl("child", "(#PCDATA)").unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains("<!DOCTYPE root [\n"));
+    assert!(xml.contains("<!ELEMENT root (child)*>"));
+    assert!(xml.contains("<!ELEMENT child (#PCDATA)>"));
+    assert!(xml.contains("]>"));
+}
+
+#[test]
+fn writer_doctype_standalone_conversion() {
+    let mut w = XmlWriter::new_vec();
+    w.set_standalone(true);
+    w.write_start_dtd("root", None, Some("root.dtd")).unwrap();
+    w.write_element_decl("root", "(child)*").unwrap();
+    w.start_external_subset();
+    w.write_element_decl("child", "(#PCDATA)").unwrap();
+    w.end_external_subset();
+    w.write_end_dtd().unwrap();
+    w.write_start_element("root").unwrap();
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+    let xml = String::from_utf8(w.into_inner()).unwrap();
+    assert!(xml.contains("<!DOCTYPE root [\n"));
+    assert!(!xml.contains("root.dtd"));
+    assert!(xml.contains("<!ELEMENT root (child)*>"));
+    assert!(xml.contains("<!ELEMENT child (#PCDATA)>"));
+}
+
+#[test]
+fn writer_doctype_normal_filter_external() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd("root", None, Some("root.dtd")).unwrap();
+        w.write_element_decl("root", "(child)*").unwrap();
+        w.start_external_subset();
+        w.write_element_decl("child", "(#PCDATA)").unwrap();
+        w.end_external_subset();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains("root.dtd"));
+    assert!(xml.contains("<!ELEMENT root (child)*>"));
+    assert!(!xml.contains("<!ELEMENT child (#PCDATA)>"));
+}
+
+#[test]
+fn writer_doctype_attlist_decl() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd("root", None, None).unwrap();
+        w.write_element_decl("root", "EMPTY").unwrap();
+        w.write_attribute_decl("root", "id", "ID", Some("#REQUIRED"), None)
+            .unwrap();
+        w.write_attribute_decl("root", "name", "CDATA", Some("#IMPLIED"), None)
+            .unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains("<!ATTLIST root id ID #REQUIRED>"));
+    assert!(xml.contains("<!ATTLIST root name CDATA #IMPLIED>"));
+}
+
+#[test]
+fn writer_doctype_entity_decl() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd("root", None, None).unwrap();
+        w.write_internal_entity_decl("copyright", "\u{00A9} 2025")
+            .unwrap();
+        w.write_external_entity_decl("logo", None, "logo.xml")
+            .unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains("<!ENTITY copyright \""));
+    assert!(xml.contains(r#"<!ENTITY logo SYSTEM "logo.xml">"#));
+}
+
+#[test]
+fn writer_doctype_notation_decl() {
+    let xml = write_xml(|w| {
+        w.write_start_dtd("root", None, None).unwrap();
+        w.write_notation_decl("gif", None, Some("image/gif"))
+            .unwrap();
+        w.write_end_dtd().unwrap();
+        w.write_start_element("root").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains(r#"<!NOTATION gif SYSTEM "image/gif">"#));
+}
+
+#[test]
+fn writer_utf16_be_byte_pattern() {
+    let mut w = XmlWriter::new_vec();
+    w.set_charset(OutputCharset::Utf16Be);
+    w.write_start_element("a").unwrap();
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+    let bytes = w.into_inner();
+    assert_eq!(
+        bytes,
+        vec![0xFE, 0xFF, 0x00, 0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E]
+    );
+}
+
+#[test]
+fn writer_utf16_le_byte_pattern() {
+    let mut w = XmlWriter::new_vec();
+    w.set_charset(OutputCharset::Utf16Le);
+    w.write_start_element("a").unwrap();
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+    let bytes = w.into_inner();
+    assert_eq!(
+        bytes,
+        vec![0xFF, 0xFE, 0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E, 0x00]
+    );
+}
+
+#[test]
+fn writer_utf32_be_byte_pattern() {
+    let mut w = XmlWriter::new_vec();
+    w.set_charset(OutputCharset::Utf32Be);
+    w.write_start_element("a").unwrap();
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+    let bytes = w.into_inner();
+    assert_eq!(
+        bytes,
+        vec![
+            0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x61, 0x00, 0x00,
+            0x00, 0x2F, 0x00, 0x00, 0x00, 0x3E
+        ]
+    );
+}
+
+#[test]
+fn writer_utf16_be_roundtrip_parse() {
+    let mut w = XmlWriter::new_vec();
+    w.set_charset(OutputCharset::Utf16Be);
+    w.write_start_element("greeting").unwrap();
+    w.write_characters("Hello, World!").unwrap();
+    w.write_end_element().unwrap();
+    w.flush().unwrap();
+    let bytes = w.into_inner();
+
+    let mut handler = RecordingHandler::new();
+    let features = FeatureSet::default();
+    let mut filter = NamespaceFilter::new(&mut handler, false);
+    let mut parser = Parser::new(&mut filter, &features, None, None, None).unwrap();
+    parser.parse_all(Bytes::from(bytes)).unwrap();
+    assert!(!handler.got_fatal, "{:?}", handler.fatal_message);
+    assert!(handler
+        .events
+        .iter()
+        .any(|e| e.starts_with("start_element:greeting")));
+    assert!(handler.events.iter().any(|e| e.contains("Hello, World!")));
+}
+
+#[test]
+fn writer_write_raw() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_raw("<b>raw content</b>").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root><b>raw content</b></root>");
+}
+
+#[test]
+fn writer_whitespace_content() {
+    let xml = write_xml(|w| {
+        w.write_start_element("root").unwrap();
+        w.write_characters("  ").unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert_eq!(xml, "<root>  </root>");
+}
+
+#[test]
+fn writer_complex_document() {
+    let xml = write_xml_indented(IndentConfig::spaces2(), |w| {
+        w.write_processing_instruction_data("xml-stylesheet", Some(r#"href="style.css""#))
+            .unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "html")
+            .unwrap();
+        w.write_default_namespace("http://www.w3.org/1999/xhtml")
+            .unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "head")
+            .unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "title")
+            .unwrap();
+        w.write_characters("Test Document").unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "body")
+            .unwrap();
+        w.write_comment(" Main content ").unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "p")
+            .unwrap();
+        w.write_attribute("class", "intro").unwrap();
+        w.write_characters("Hello, ").unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "strong")
+            .unwrap();
+        w.write_characters("World").unwrap();
+        w.write_end_element().unwrap();
+        w.write_characters("!").unwrap();
+        w.write_end_element().unwrap();
+        w.write_start_element_ns("http://www.w3.org/1999/xhtml", "br")
+            .unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+        w.write_end_element().unwrap();
+    });
+    assert!(xml.contains(r#"xmlns="http://www.w3.org/1999/xhtml""#));
+    assert!(xml.contains("<title>Test Document</title>"));
+    assert!(xml.contains("<br/>"));
+    assert!(xml.contains("<!-- Main content -->"));
+}
+
+#[test]
+fn indent_config_factories() {
+    assert_eq!(IndentConfig::tabs().indent_char(), '\t');
+    assert_eq!(IndentConfig::tabs().indent_count(), 1);
+    assert_eq!(IndentConfig::spaces2().indent_count(), 2);
+    assert_eq!(IndentConfig::spaces4().indent_count(), 4);
+    assert_eq!(IndentConfig::spaces(3).indent_count(), 3);
+    assert!(IndentConfig::new('x', 1).is_err());
+    assert!(IndentConfig::new(' ', 0).is_err());
 }

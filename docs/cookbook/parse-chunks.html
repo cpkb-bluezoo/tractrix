@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parse in chunks — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="../index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../getting-started.html">Getting started</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="../handler.html">XmlHandler</a></li>
+        <li><a href="../writer.html">XmlWriter</a></li>
+        <li><a href="../namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="parse-chunks.html" aria-current="page">Parse in chunks</a></li>
+        <li><a href="collect-text.html">Collect text</a></li>
+        <li><a href="roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Parse in chunks</h1>
+        <p class="lead">Feed a byte stream with receive(); close() when the peer finishes.</p>
+      </header>
+
+      <p>
+        Tractrix never blocks on I/O. Your runtime reads bytes and calls
+        <code>receive</code>. Call <code>close</code> exactly once at end of
+        stream (idempotent thereafter). Use <code>reset</code> to reuse the
+        parser for another document.
+      </p>
+
+      <pre><code>use bytes::Bytes;
+use tractrix::{FeatureSet, NamespaceFilter, Parser, XmlHandler};
+
+struct App { /* … */ }
+impl XmlHandler for App { /* override what you need */ }
+
+fn feed(stream: impl Iterator&lt;Item = Bytes&gt;) -&gt; tractrix::ParseResult&lt;()&gt; {
+    let mut app = App { /* … */ };
+    let mut filter = NamespaceFilter::new(&amp;mut app, false);
+    let features = FeatureSet::default();
+    let mut parser = Parser::new(&amp;mut filter, &amp;features, None, None, None)?;
+
+    for chunk in stream {
+        parser.receive(chunk)?;
+    }
+    parser.close()?;
+    Ok(())
+}</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Contract</strong></p>
+        <p>
+          Chunks may split tokens arbitrarily (<code>&lt;ro</code> then
+          <code>ot/&gt;</code>). Streamed text may span
+          <code>receive</code> calls — copy data you keep and honour
+          <a href="../handler.html#lifetimes"><code>save_buffers</code></a>.
+        </p>
+      </div>
+
+      <p>
+        One-shot buffers: <code>parser.parse_all(bytes)</code> is
+        <code>receive</code> + <code>close</code>.
+      </p>
+
+      <p class="footer">
+        <a href="../handler.html">XmlHandler</a> ·
+        <a href="collect-text.html">Collect text</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

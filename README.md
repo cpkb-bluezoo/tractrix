@@ -1,7 +1,13 @@
 # Tractrix
 
-A non-blocking, push-model XML parser for Rust. Ported from the
-[Gonzalez](https://github.com/cpkb-bluezoo/gonzalez) streaming XML scanner.
+A non-blocking, push-model XML parser and serializer for Rust. Ported from the
+[Gonzalez](https://github.com/cpkb-bluezoo/gonzalez) streaming XML scanner and
+writer.
+
+**Documentation:** [Usage guides (GitHub Pages)](https://cpkb-bluezoo.github.io/tractrix/)
+cover the `XmlHandler` and `XmlWriter` contracts, features, and security
+defaults. This README is a short overview; the HTML docs are the primary
+reference for sequencing and lifetime rules.
 
 ## Overview
 
@@ -214,17 +220,47 @@ need an alternate checkout. A report is written to
 
 Current score: **2359 / 2359 (100%)**.
 
+## Serialization
+
+[`XmlWriter`](src/writer.rs) is a streaming serializer matching Gonzalez
+`XMLWriter`. It writes to any `std::io::Write` sink and supports:
+
+- Pretty-print via [`IndentConfig`](src/indent.rs) (`tabs`, `spaces2`,
+  `spaces4`, `spaces(n)`)
+- Output charset / BOM (`UTF-8`, `UTF-16BE/LE`, `UTF-32BE/LE`, `ISO-8859-1`,
+  `US-ASCII`, plus other `encoding_rs` encodings)
+- XML 1.1 escaping mode
+- Namespace declarations with redundant-decl suppression
+- Empty-element optimization (`<foo/>`)
+- Full DTD output, including standalone conversion (inline external subset)
+
+```rust
+use tractrix::{IndentConfig, XmlWriter};
+
+let mut w = XmlWriter::new_vec();
+w.set_indent_config(Some(IndentConfig::spaces2()));
+w.write_start_element("root").unwrap();
+w.write_start_element("child").unwrap();
+w.write_characters("hello").unwrap();
+w.write_end_element().unwrap();
+w.write_end_element().unwrap();
+w.flush().unwrap();
+assert_eq!(
+    String::from_utf8(w.into_inner()).unwrap(),
+    "<root>\n  <child>hello</child>\n</root>"
+);
+```
+
 ## Non-Goals
 
 Tractrix is intentionally minimal — a streaming well-formedness checker and
-DTD validator with namespace support. The following are explicitly out of
-scope:
+DTD validator with namespace support, plus a matching streaming serializer.
+The following are explicitly out of scope:
 
 - **SAX/JAXP compatibility layer** — Tractrix uses its own `XmlHandler` trait,
   not `org.xml.sax.ContentHandler`.
-- **XSLT / XPath / XQuery** — Tractrix is a parser, not a processing engine.
+- **XSLT / XPath / XQuery** — Tractrix is not a processing engine.
 - **XML Schema / RELAX NG** — Only DTD validation is supported.
-- **XMLWriter / serialization** — Tractrix is read-only.
 - **DOM / tree building** — The consumer builds whatever representation it
   needs from the event stream.
 - **Async runtime integration** — Tractrix is runtime-agnostic; it accepts

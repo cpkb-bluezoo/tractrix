@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Namespaces — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html" aria-current="page">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Namespaces</h1>
+        <p class="lead">Scanner is namespace-unaware; NamespaceFilter turns xmlns into events.</p>
+      </header>
+
+      <h2 id="two-layers">Two layers</h2>
+      <ol class="contract">
+        <li><strong>Scanner</strong> — always reports <code>xmlns</code> / <code>xmlns:prefix</code> as normal attributes.</li>
+        <li><strong>NamespaceFilter</strong> — optional wrapper that converts those attributes into
+          <code>XmlHandler::namespace(prefix, uri)</code> and applies Namespace Constraints.</li>
+      </ol>
+
+      <h2 id="wiring">Wiring</h2>
+      <pre><code>use tractrix::{FeatureSet, NamespaceFilter, Parser, XmlHandler};
+
+let mut app = MyHandler::default();
+// namespace_prefixes = false → xmlns attrs are not also reported as attributes
+let mut filter = NamespaceFilter::new(&amp;mut app, false);
+let features = FeatureSet::default(); // namespaces = true
+let mut parser = Parser::new(&amp;mut filter, &amp;features, None, None, None)?;</code></pre>
+
+      <h2 id="namespace-event">The <code>namespace</code> event</h2>
+      <ul class="contract">
+        <li>Fires after <code>start_element</code>, before attributes (and before <code>end_attributes</code>).</li>
+        <li>Empty <code>prefix</code> means the default namespace (<code>xmlns="…"</code>).</li>
+        <li>There is no matching end-namespace event; scope ends with <code>end_element</code>.</li>
+        <li>With <code>namespace_prefixes = true</code>, xmlns attributes are still reported in addition to <code>namespace</code> events.</li>
+      </ul>
+
+      <h2 id="constants">Constants</h2>
+      <pre><code>XML_NAMESPACE_URI    // http://www.w3.org/XML/1998/namespace
+XMLNS_NAMESPACE_URI  // http://www.w3.org/2000/xmlns/</code></pre>
+
+      <h2 id="writer">Writer side</h2>
+      <p>
+        <a href="writer.html"><code>XmlWriter</code></a> maintains its own
+        prefix stack. Use <code>write_namespace</code> /
+        <code>write_default_namespace</code> while a start tag is open.
+        <code>write_start_element_ns</code> resolves a prefix from current
+        bindings; <code>write_start_element_prefixed</code> does not emit
+        <code>xmlns</code> automatically.
+      </p>
+
+      <p class="footer">
+        <a href="features.html">Features</a> ·
+        <a href="handler.html#element-order">Element event order</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

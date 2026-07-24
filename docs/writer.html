@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XmlWriter — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html" aria-current="page">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>XmlWriter</h1>
+        <p class="lead">Streaming serializer matching Gonzalez XMLWriter — indent, charset, namespaces, DTD.</p>
+      </header>
+
+      <p>
+        <code>XmlWriter&lt;W: Write&gt;</code> buffers output and flushes to the
+        sink when a threshold is reached (or on <code>flush</code>/<code>close</code>).
+        It is not thread-safe. <code>close</code> flushes but does
+        <strong>not</strong> close the underlying sink.
+      </p>
+
+      <h2 id="construction">Construction</h2>
+      <pre><code>XmlWriter::new(sink)                          // 4 KiB buffer, UTF-8
+XmlWriter::with_indent(sink, IndentConfig::spaces2())
+XmlWriter::with_capacity(sink, capacity)
+XmlWriter::new_vec()                          // in-memory Vec&lt;u8&gt;</code></pre>
+
+      <h2 id="options">Options (set before writing)</h2>
+      <table>
+        <thead>
+          <tr><th>Method</th><th>Default</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>set_indent_config(Option&lt;IndentConfig&gt;)</code></td>
+            <td><code>None</code> (compact)</td>
+            <td>Pretty-print: newline + <code>indent_count × depth</code> chars before child elements / comments / PIs</td>
+          </tr>
+          <tr>
+            <td><code>set_charset(OutputCharset)</code> / <code>set_charset_name</code></td>
+            <td>UTF-8</td>
+            <td>Output encoding; UTF-16/32 emit a BOM on first write</td>
+          </tr>
+          <tr>
+            <td><code>set_xml11(bool)</code></td>
+            <td><code>false</code></td>
+            <td>Escape CR, C1 controls, and U+2028 as character references</td>
+          </tr>
+          <tr>
+            <td><code>set_standalone(bool)</code></td>
+            <td><code>false</code></td>
+            <td>Omit PUBLIC/SYSTEM on DOCTYPE; inline external-subset decls into the internal subset</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 id="indent">IndentConfig</h3>
+      <pre><code>IndentConfig::tabs()       // '\t' × 1
+IndentConfig::spaces2()    // ' ' × 2
+IndentConfig::spaces4()
+IndentConfig::spaces(n)
+IndentConfig::new(ch, n)?  // ch must be ' ' or '\t'; n &gt; 0</code></pre>
+
+      <h3 id="charset">OutputCharset</h3>
+      <p>
+        <code>Utf8</code>, <code>Utf16Be</code>, <code>Utf16Le</code>,
+        <code>Utf32Be</code>, <code>Utf32Le</code>, <code>Iso8859_1</code>,
+        <code>UsAscii</code>, or <code>Encoding(&amp;'static Encoding)</code>.
+        Name aliases like <code>"UTF-16"</code> map to big-endian with BOM,
+        matching Gonzalez.
+      </p>
+
+      <h2 id="element-contract">Element write contract</h2>
+      <ol class="contract">
+        <li>Open with <code>write_start_element</code>, <code>write_start_element_ns</code>, or <code>write_start_element_prefixed</code>.</li>
+        <li>While the start tag is open: <code>write_attribute*</code>, <code>write_namespace</code>, <code>write_default_namespace</code>.</li>
+        <li>Any content call (<code>write_characters</code>, nested start, comment, PI, …) closes the start tag with <code>&gt;</code>.</li>
+        <li><code>write_end_element</code> with no content → self-closing <code>/&gt;</code>; otherwise <code>&lt;/qName&gt;</code>.</li>
+      </ol>
+      <div class="callout">
+        <p><strong class="label">Prefixed start does not emit xmlns</strong></p>
+        <p>
+          <code>write_start_element_prefixed</code> writes the qName only.
+          Call <code>write_namespace</code> / <code>write_default_namespace</code>
+          explicitly if a declaration is required. Redundant declarations
+          (same prefix already bound to the same URI) are suppressed.
+        </p>
+      </div>
+
+      <h2 id="content">Content</h2>
+      <table>
+        <thead>
+          <tr><th>Method</th><th>Escaping</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>write_characters</code></td><td><code>&amp;lt;</code> <code>&amp;gt;</code> <code>&amp;amp;</code>; illegal C0 → decimal refs; XML 1.1 also C1 / U+2028</td></tr>
+          <tr><td><code>write_start_cdata</code> / <code>write_end_cdata</code></td><td>No escaping; rejects <code>]]&gt;</code> and illegal controls</td></tr>
+          <tr><td><code>write_comment</code></td><td>Sanitises <code>--</code> and trailing <code>-</code></td></tr>
+          <tr><td><code>write_processing_instruction*</code></td><td>Sanitises <code>?&gt;</code> in data</td></tr>
+          <tr><td><code>write_entity_ref</code></td><td>Emits <code>&amp;name;</code></td></tr>
+          <tr><td><code>write_raw</code></td><td>Unescaped (XSLT disable-output-escaping); may yield non-WF XML</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="dtd">DTD output</h2>
+      <pre><code>write_start_dtd(name, public_id, system_id)
+write_element_decl / write_attribute_decl
+write_internal_entity_decl / write_external_entity_decl
+write_notation_decl / write_unparsed_entity_decl
+start_external_subset() / end_external_subset()
+write_end_dtd()</code></pre>
+      <ul class="contract">
+        <li>Normal mode: only internal-subset decls are written; external-subset decls between <code>start_external_subset</code> and <code>end_external_subset</code> are omitted.</li>
+        <li>Standalone mode: PUBLIC/SYSTEM omitted; all decls (including external subset) are inlined.</li>
+        <li>The internal subset bracket <code> [</code> opens lazily on the first declaration.</li>
+      </ul>
+
+      <h2 id="lookups">Namespace lookups</h2>
+      <p>
+        <code>get_prefix</code>, <code>get_namespace_uri</code>,
+        <code>get_all_namespace_bindings</code>. The implicit
+        <code>xml</code> ↔ <code>http://www.w3.org/XML/1998/namespace</code>
+        binding is recognised but not listed in
+        <code>get_all_namespace_bindings</code>.
+      </p>
+
+      <h2 id="lifecycle">Lifecycle</h2>
+      <pre><code>w.flush()?;   // close pending start tag if needed, send buffer
+w.close()?;   // same as flush; does not close the sink
+let sink = w.into_inner();</code></pre>
+
+      <p class="footer">
+        <a href="cookbook/roundtrip.html">Parse → write recipe</a> ·
+        <a href="handler.html">XmlHandler</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

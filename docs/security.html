@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html" aria-current="page">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Security</h1>
+        <p class="lead">Secure-by-default parsing: no XXE unless you opt in.</p>
+      </header>
+
+      <h2 id="defaults">Defaults</h2>
+      <ul class="contract">
+        <li>External general and parameter entities are <strong>disabled</strong>.</li>
+        <li><code>access_external_dtd</code> is empty — no protocol is allowed.</li>
+        <li>Entity expansion is capped at <strong>64 000</strong> expansions per document (billion-laughs mitigation).</li>
+        <li>If you pass <code>None</code> for the resolver, the scanner behaves as a refusing resolver for external content.</li>
+      </ul>
+
+      <h2 id="resolvers">EntityResolver</h2>
+      <table>
+        <thead>
+          <tr><th>Type</th><th>Behaviour</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>RefusingEntityResolver</code></td>
+            <td>Always returns <code>Ok(None)</code> — no external loads</td>
+          </tr>
+          <tr>
+            <td><code>FileEntityResolver</code></td>
+            <td>Loads from the filesystem when the protocol is allow-listed via <code>access_external_dtd</code></td>
+          </tr>
+          <tr>
+            <td>Custom <code>EntityResolver</code></td>
+            <td><code>resolve</code> / <code>resolve_entity</code> return <code>Ok(Some(ResolvedEntity))</code>, <code>Ok(None)</code>, or <code>Err</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="opt-in">Opting in to external DTDs / entities</h2>
+      <pre><code>use tractrix::{FeatureSet, FileEntityResolver, Parser};
+
+let mut features = FeatureSet::default();
+features.external_general_entities = true;
+features.external_parameter_entities = true;
+features.access_external_dtd = "file".to_string();
+
+let resolver = Box::new(FileEntityResolver {
+    access_external_dtd: features.access_external_dtd.clone(),
+});
+
+let mut parser = Parser::new(
+    &amp;mut handler,
+    &amp;features,
+    Some(resolver),
+    None,
+    Some("file:///path/to/doc.xml".into()),
+)?;</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Warning</strong></p>
+        <p>
+          Enabling external entities exposes your process to XXE-class attacks
+          if you parse untrusted XML. Prefer leaving the defaults alone unless
+          you fully control the document and the reachable file set.
+        </p>
+      </div>
+
+      <h2 id="doctype">Disallowing DOCTYPE</h2>
+      <p>
+        Set <code>disallow_doctype_decl = true</code> to reject any DTD
+        declaration outright — useful for untrusted feeds that must be
+        document-only.
+      </p>
+
+      <p class="footer">
+        <a href="features.html">FeatureSet reference</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

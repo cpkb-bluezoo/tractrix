@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Collect text — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="../index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../getting-started.html">Getting started</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="../handler.html">XmlHandler</a></li>
+        <li><a href="../writer.html">XmlWriter</a></li>
+        <li><a href="../namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="collect-text.html" aria-current="page">Collect text</a></li>
+        <li><a href="roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Collect text under one element</h1>
+        <p class="lead">Track depth / a flag; append characters; clear on start.</p>
+      </header>
+
+      <pre><code>use bytes::Bytes;
+use tractrix::{FeatureSet, ParseResult, Parser, XmlHandler};
+
+struct TitleCollector {
+    in_title: bool,
+    title: String,
+}
+
+impl XmlHandler for TitleCollector {
+    fn start_element(&amp;mut self, q_name: &amp;str) -&gt; ParseResult&lt;()&gt; {
+        if q_name == "title" {
+            self.in_title = true;
+            self.title.clear();
+        }
+        Ok(())
+    }
+
+    fn characters(&amp;mut self, text: &amp;str, _ignorable: bool, _end: bool) -&gt; ParseResult&lt;()&gt; {
+        if self.in_title {
+            self.title.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn end_element(&amp;mut self) -&gt; ParseResult&lt;()&gt; {
+        self.in_title = false;
+        Ok(())
+    }
+}
+
+let xml = br#"&lt;doc&gt;&lt;title&gt;Hello &amp;amp; world&lt;/title&gt;&lt;/doc&gt;"#;
+let mut handler = TitleCollector { in_title: false, title: String::new() };
+let features = FeatureSet::default();
+let mut parser = Parser::new(&amp;mut handler, &amp;features, None, None, None).unwrap();
+parser.parse_all(Bytes::from_static(xml)).unwrap();
+assert_eq!(handler.title, "Hello &amp; world");</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Nested titles</strong></p>
+        <p>
+          The simple flag above treats any nested <code>title</code> the same.
+          For nesting, keep a depth counter (increment on start, decrement on
+          end) and only append when depth matches the target.
+        </p>
+      </div>
+
+      <p class="footer">
+        <a href="../handler.html#streaming">Streaming contract</a> ·
+        <a href="roundtrip.html">Parse → write</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html" aria-current="page">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Architecture</h1>
+        <p class="lead">How bytes become events — and how the writer sits beside the parser.</p>
+      </header>
+
+      <h2 id="parse-pipeline">Parse pipeline</h2>
+      <pre class="pipeline">Parser
+  ├── ExternalEntityDecoder   bytes → chars (BOM, XML/text decl, charset, EOL)
+  └── Scanner                 chars → XmlHandler events (WF, DTD, validation)
+        └── optional NamespaceFilter   xmlns attrs → namespace() events</pre>
+
+      <table>
+        <thead>
+          <tr><th>Component</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>Parser</code></td>
+            <td>Owns decoder + scanner. Public entry: <code>receive</code>, <code>close</code>, <code>reset</code>, <code>parse_all</code>.</td>
+          </tr>
+          <tr>
+            <td><code>ExternalEntityDecoder</code></td>
+            <td>Detects BOM and declarations, decodes via <code>encoding_rs</code> (UTF-32 manually), normalises line endings.</td>
+          </tr>
+          <tr>
+            <td><code>Scanner</code></td>
+            <td>Hot-path well-formedness + optional DTD validation. Namespace-unaware.</td>
+          </tr>
+          <tr>
+            <td><code>NamespaceFilter</code></td>
+            <td>Optional stage in front of your app handler; emits <code>namespace</code> and rewrites qNames.</td>
+          </tr>
+          <tr>
+            <td><code>XmlHandler</code></td>
+            <td>Your code. Push callbacks — no token stream, no DOM.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="no-dom">No document tree</h2>
+      <p>
+        Tractrix does not build an AST. The serializable surface of a parse is
+        the <a href="handler.html"><code>XmlHandler</code></a> event vocabulary.
+        Applications that need a tree materialise one themselves from those
+        events.
+      </p>
+
+      <h2 id="writer">Writer</h2>
+      <p>
+        <a href="writer.html"><code>XmlWriter</code></a> is a sibling API, not
+        an <code>XmlHandler</code> implementor. It is an imperative streaming
+        serializer (<code>write_start_element</code>, …) with options matching
+        Gonzalez <code>XMLWriter</code>. You can bridge parse → write in your
+        own handler (see <a href="cookbook/roundtrip.html">Parse → write</a>).
+      </p>
+
+      <h2 id="ownership">Ownership and lifetimes</h2>
+      <ul class="contract">
+        <li>The handler is borrowed for the lifetime of <code>Parser</code> (<code>&amp;mut dyn XmlHandler</code>).</li>
+        <li><code>FeatureSet</code> is consulted at construction; keep it stable while parsing (some features refuse mid-parse changes).</li>
+        <li>Optional <code>EntityResolver</code> is boxed into the scanner for external DTD/entity loads.</li>
+        <li><code>XmlWriter</code> owns its <code>Write</code> sink; <code>close</code>/<code>flush</code> do <em>not</em> close the sink.</li>
+      </ul>
+
+      <h2 id="non-goals">Non-goals</h2>
+      <ul>
+        <li>SAX/JAXP <code>ContentHandler</code> compatibility layer</li>
+        <li>XSLT / XPath / XQuery</li>
+        <li>XML Schema / RELAX NG (DTD only)</li>
+        <li>Built-in DOM</li>
+        <li>Async runtime integration (feed <code>Bytes</code> from your own I/O)</li>
+      </ul>
+
+      <p class="footer">
+        <a href="handler.html">XmlHandler contract</a> ·
+        <a href="https://github.com/cpkb-bluezoo/tractrix">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>
