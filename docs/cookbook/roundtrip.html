@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parse → write — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="../index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../getting-started.html">Getting started</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="../handler.html">XmlHandler</a></li>
+        <li><a href="../writer.html">XmlWriter</a></li>
+        <li><a href="../namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="collect-text.html">Collect text</a></li>
+        <li><a href="roundtrip.html" aria-current="page">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Parse → write</h1>
+        <p class="lead">Bridge XmlHandler events into XmlWriter for a streaming rewrite.</p>
+      </header>
+
+      <p>
+        <code>XmlWriter</code> is not itself an <code>XmlHandler</code>.
+        Implement a thin handler that forwards the events you care about.
+        Keep an element name stack because <code>end_element</code> has no
+        name, and buffer attribute values until <code>end</code> is true.
+      </p>
+
+      <pre><code>use std::io;
+use tractrix::{IndentConfig, ParseResult, XmlHandler, XmlWriter};
+
+struct Rewrite&lt;'a, W: io::Write&gt; {
+    w: &amp;'a mut XmlWriter&lt;W&gt;,
+    stack: Vec&lt;String&gt;,
+    attr_name: Option&lt;String&gt;,
+    attr_value: String,
+}
+
+impl&lt;W: io::Write&gt; XmlHandler for Rewrite&lt;'_, W&gt; {
+    fn start_element(&amp;mut self, q_name: &amp;str) -&gt; ParseResult&lt;()&gt; {
+        self.w
+            .write_start_element(q_name)
+            .map_err(|e| tractrix::ParseError::new(e.to_string()))?;
+        self.stack.push(q_name.to_string());
+        Ok(())
+    }
+
+    fn start_attribute(
+        &amp;mut self,
+        name: &amp;str,
+        _ty: &amp;str,
+        _declared: bool,
+        _specified: bool,
+    ) -&gt; ParseResult&lt;()&gt; {
+        self.attr_name = Some(name.to_string());
+        self.attr_value.clear();
+        Ok(())
+    }
+
+    fn attribute_value_content(&amp;mut self, value: &amp;str, end: bool) -&gt; ParseResult&lt;()&gt; {
+        self.attr_value.push_str(value);
+        if end {
+            if let Some(name) = self.attr_name.take() {
+                self.w
+                    .write_attribute(&amp;name, &amp;self.attr_value)
+                    .map_err(|e| tractrix::ParseError::new(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn characters(&amp;mut self, text: &amp;str, _ign: bool, _end: bool) -&gt; ParseResult&lt;()&gt; {
+        self.w
+            .write_characters(text)
+            .map_err(|e| tractrix::ParseError::new(e.to_string()))?;
+        Ok(())
+    }
+
+    fn end_element(&amp;mut self) -&gt; ParseResult&lt;()&gt; {
+        self.stack.pop();
+        self.w
+            .write_end_element()
+            .map_err(|e| tractrix::ParseError::new(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// Usage sketch:
+// let mut w = XmlWriter::with_indent(Vec::new(), IndentConfig::spaces2());
+// let mut bridge = Rewrite { w: &amp;mut w, stack: vec![], attr_name: None, attr_value: String::new() };
+// let mut parser = Parser::new(&amp;mut bridge, &amp;features, None, None, None)?;
+// parser.parse_all(input)?;
+// w.flush()?;</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Namespaces &amp; DTD</strong></p>
+        <p>
+          Forward <code>namespace</code> to <code>write_namespace</code> /
+          <code>write_default_namespace</code>. Map DTD and lexical events to
+          the corresponding writer methods if you need a full round-trip.
+          Writer methods return <code>io::Result</code>; map failures into
+          <code>ParseError</code> (as above) so the parser can abort cleanly.
+        </p>
+      </div>
+
+      <p class="footer">
+        <a href="../writer.html">XmlWriter contract</a> ·
+        <a href="../handler.html">XmlHandler contract</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

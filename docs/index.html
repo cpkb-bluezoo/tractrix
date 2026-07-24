@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tractrix documentation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html" aria-current="page">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Tractrix</h1>
+        <p class="lead">Non-blocking push-model XML for Rust — parse bytes into events, or serialize events back to bytes.</p>
+      </header>
+
+      <p>
+        Tractrix is a port of the
+        <a href="https://github.com/cpkb-bluezoo/gonzalez">Gonzalez</a>
+        streaming XML scanner and writer. These pages are the primary usage
+        documentation: they define the <strong>contracts</strong> you must
+        honour when implementing handlers or driving the writer. API detail
+        also lives in rustdoc; start here for sequencing and lifetime rules.
+      </p>
+
+      <h2 id="pipeline">Pipeline</h2>
+      <pre class="pipeline" aria-label="Tractrix pipeline">bytes ──▶ ExternalEntityDecoder ──▶ Scanner ──▶ (NamespaceFilter?) ──▶ XmlHandler
+           BOM, decl, charset,            WF + DTD                   xmlns → namespace
+           line endings                   + validation               events
+
+XmlWriter ──▶ bytes   (indent · charset/BOM · XML 1.1 · standalone DTD)</pre>
+
+      <h2 id="reading-order">Reading order</h2>
+      <ol class="contract">
+        <li><a href="getting-started.html">Getting started</a> — dependency, first parse, first serialize</li>
+        <li><a href="architecture.html">Architecture</a> — who owns what in the pipeline</li>
+        <li><a href="handler.html">XmlHandler</a> — <em>the</em> parse contract (ordering, chunks, buffers)</li>
+        <li><a href="writer.html">XmlWriter</a> — serialize contract and options</li>
+        <li><a href="namespaces.html">Namespaces</a> · <a href="features.html">Features</a> · <a href="security.html">Security</a></li>
+      </ol>
+
+      <h2 id="guides">Guides</h2>
+      <table>
+        <thead>
+          <tr><th>Guide</th><th>What it covers</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><a href="handler.html">XmlHandler</a></td>
+            <td>Event order, streamed <code>end</code> flags, <code>save_buffers</code>, errors</td>
+          </tr>
+          <tr>
+            <td><a href="writer.html">XmlWriter</a></td>
+            <td>Indent, charset, empty elements, DTD, namespaces</td>
+          </tr>
+          <tr>
+            <td><a href="namespaces.html">Namespaces</a></td>
+            <td><code>NamespaceFilter</code>, prefix events vs xmlns attributes</td>
+          </tr>
+          <tr>
+            <td><a href="features.html">Features</a></td>
+            <td><code>FeatureSet</code> defaults and SAX-like feature URIs</td>
+          </tr>
+          <tr>
+            <td><a href="security.html">Security</a></td>
+            <td>XXE defaults, entity limits, resolvers</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="cookbook">Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse a byte stream in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text under one element</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse then rewrite with XmlWriter</a></li>
+      </ul>
+
+      <h2 id="crate">Crate</h2>
+      <pre><code>tractrix = "0.1"</code></pre>
+      <p>
+        License: LGPL-2.1-or-later ·
+        W3C XML Conformance: <strong>2359 / 2359</strong>
+      </p>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/tractrix">GitHub</a> ·
+        <a href="https://github.com/cpkb-bluezoo/tractrix/blob/main/README.md">README</a> ·
+        LGPL-2.1-or-later
+      </p>
+    </main>
+  </div>
+</body>
+</html>

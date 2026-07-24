@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Getting started — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html" aria-current="page">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>Getting started</h1>
+        <p class="lead">Add the crate, implement a handler, feed bytes — or drive XmlWriter to emit XML.</p>
+      </header>
+
+      <h2 id="add-dependency">Add the dependency</h2>
+      <pre><code>[dependencies]
+tractrix = "0.1"
+bytes = "1"</code></pre>
+
+      <h2 id="first-parse">First parse</h2>
+      <p>
+        Implement <a href="handler.html"><code>XmlHandler</code></a> on your type.
+        Defaults are no-ops except <code>fatal_error</code>, so override only
+        what you need. Pass the handler to <code>Parser::new</code>, then
+        <code>receive</code> chunks and <code>close</code> (or use
+        <code>parse_all</code> for a single buffer).
+      </p>
+      <pre><code>use bytes::Bytes;
+use tractrix::{FeatureSet, Parser, XmlHandler};
+
+struct CountingHandler {
+    elements: usize,
+}
+
+impl XmlHandler for CountingHandler {
+    fn start_element(&amp;mut self, _q_name: &amp;str) -&gt; tractrix::ParseResult&lt;()&gt; {
+        self.elements += 1;
+        Ok(())
+    }
+}
+
+let mut handler = CountingHandler { elements: 0 };
+let features = FeatureSet::default();
+let mut parser = Parser::new(&amp;mut handler, &amp;features, None, None, None).unwrap();
+
+parser.receive(Bytes::from("&lt;root&gt;hel")).unwrap();
+parser.receive(Bytes::from("lo&lt;/root&gt;")).unwrap();
+parser.close().unwrap();
+assert_eq!(handler.elements, 1);
+
+parser.reset();
+parser.parse_all(Bytes::from("&lt;doc/&gt;")).unwrap();</code></pre>
+
+      <div class="callout">
+        <p><strong class="label">Contract</strong></p>
+        <p>
+          Text and attribute slices are borrowed from the scanner buffer and
+          valid only for the duration of the callback. Copy what you keep, and
+          honour <code>save_buffers</code> — see
+          <a href="handler.html#lifetimes">XmlHandler lifetimes</a>.
+        </p>
+      </div>
+
+      <h2 id="namespaces">Namespace-aware parsing</h2>
+      <p>
+        The scanner treats <code>xmlns</code> as ordinary attributes. Wrap your
+        handler in <code>NamespaceFilter</code> to get
+        <code>namespace(prefix, uri)</code> events:
+      </p>
+      <pre><code>use tractrix::{DefaultHandler, FeatureSet, NamespaceFilter, Parser};
+
+let mut app = DefaultHandler;
+let mut filter = NamespaceFilter::new(&amp;mut app, false);
+let features = FeatureSet::default(); // namespaces = true
+let mut parser = Parser::new(&amp;mut filter, &amp;features, None, None, None).unwrap();</code></pre>
+      <p>Details: <a href="namespaces.html">Namespaces</a>.</p>
+
+      <h2 id="first-write">First serialize</h2>
+      <p>
+        <a href="writer.html"><code>XmlWriter</code></a> writes to any
+        <code>std::io::Write</code>. Configure indent/charset before emitting
+        markup. Start tags stay open for attributes and namespace decls until
+        content or <code>write_end_element</code>.
+      </p>
+      <pre><code>use tractrix::{IndentConfig, XmlWriter};
+
+let mut w = XmlWriter::new_vec();
+w.set_indent_config(Some(IndentConfig::spaces2()));
+w.write_start_element("root").unwrap();
+w.write_start_element("child").unwrap();
+w.write_characters("hello").unwrap();
+w.write_end_element().unwrap();
+w.write_end_element().unwrap();
+w.flush().unwrap();
+assert_eq!(
+    String::from_utf8(w.into_inner()).unwrap(),
+    "&lt;root&gt;\n  &lt;child&gt;hello&lt;/child&gt;\n&lt;/root&gt;"
+);</code></pre>
+
+      <h2 id="next">Next</h2>
+      <ul>
+        <li><a href="architecture.html">Architecture</a> — pipeline ownership</li>
+        <li><a href="handler.html">XmlHandler</a> — full event contract</li>
+        <li><a href="security.html">Security</a> — defaults before enabling external entities</li>
+      </ul>
+
+      <p class="footer">
+        <a href="index.html">Home</a> ·
+        <a href="https://github.com/cpkb-bluezoo/tractrix">GitHub</a> ·
+        LGPL-2.1-or-later
+      </p>
+    </main>
+  </div>
+</body>
+</html>

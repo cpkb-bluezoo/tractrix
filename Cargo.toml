@@ -1,15 +1,15 @@
 [package]
 name = "tractrix"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
-description = "Non-blocking XML push parser (Gonzalez-style)"
+description = "Non-blocking XML push parser and serializer (Gonzalez-style)"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
 authors = ["Chris Burdess <dog@gnu.org>"]
 repository = "https://github.com/cpkb-bluezoo/tractrix"
 homepage = "https://github.com/cpkb-bluezoo/tractrix"
-keywords = ["xml", "parser", "streaming", "sax", "non-blocking"]
+keywords = ["xml", "parser", "serializer", "streaming", "sax"]
 categories = ["encoding", "parser-implementations"]
 # Keep the ~15MB W3C suite in git/CI, but out of the crates.io package.
 exclude = ["xmlconf/"]

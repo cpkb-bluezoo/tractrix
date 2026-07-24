@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XmlHandler contract — Tractrix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+      <a class="brand" href="index.html">Tractrix</a>
+      <p class="tag">Streaming XML parser &amp; writer</p>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="index.html">Home</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+      </ul>
+      <h2>Contracts</h2>
+      <ul>
+        <li><a href="handler.html" aria-current="page">XmlHandler</a></li>
+        <li><a href="writer.html">XmlWriter</a></li>
+        <li><a href="namespaces.html">Namespaces</a></li>
+      </ul>
+      <h2>Configuration</h2>
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="security.html">Security</a></li>
+      </ul>
+      <h2>Cookbook</h2>
+      <ul>
+        <li><a href="cookbook/parse-chunks.html">Parse in chunks</a></li>
+        <li><a href="cookbook/collect-text.html">Collect text</a></li>
+        <li><a href="cookbook/roundtrip.html">Parse → write</a></li>
+      </ul>
+    </nav>
+    <main class="main">
+      <header>
+        <h1>XmlHandler contract</h1>
+        <p class="lead">The event vocabulary, ordering rules, streaming chunks, and buffer lifetimes you must honour.</p>
+      </header>
+
+      <p>
+        <code>XmlHandler</code> is the sole consumer API for parse results.
+        It mirrors Gonzalez <code>XMLHandler</code>: raw qNames, streamed
+        content with an explicit <code>end</code> flag, and optional namespace
+        events from <a href="namespaces.html"><code>NamespaceFilter</code></a>.
+        Every method has a default no-op except <code>fatal_error</code>.
+      </p>
+
+      <h2 id="document-order">Document-level order</h2>
+      <ol class="contract">
+        <li><code>set_locator</code> — may fire early; locator stays valid for the parse</li>
+        <li><code>set_xml11</code> — after the XML declaration (or default 1.0)</li>
+        <li><code>start_document</code></li>
+        <li>Optional prolog: PIs, comments, then DTD (<code>start_dtd</code> … decls … <code>end_dtd</code>)</li>
+        <li>Document element (see <a href="#element-order">element order</a>)</li>
+        <li>Optional epilog: comments / PIs</li>
+        <li><code>end_document</code></li>
+      </ol>
+
+      <h2 id="element-order">Element order</h2>
+      <p>For <code>&lt;item id="42"&gt;text&lt;/item&gt;</code> the handler sees:</p>
+      <ol class="contract">
+        <li><code>start_element("item")</code> — raw qName only</li>
+        <li>Zero or more of:
+          <ul>
+            <li><code>namespace(prefix, uri)</code> — only with <code>NamespaceFilter</code>; empty prefix = default NS</li>
+            <li><code>start_attribute(name, ty, declared, specified)</code> then one or more
+              <code>attribute_value_content(value, end)</code> (last chunk has <code>end = true</code>)</li>
+          </ul>
+        </li>
+        <li><code>end_attributes()</code> — <strong>always</strong> once per element, even with zero attributes</li>
+        <li>Content: <code>characters</code>, nested elements, comments, PIs, CDATA brackets, entity markers, …</li>
+        <li><code>end_element()</code> — <strong>no name</strong>; keep your own stack from <code>start_element</code></li>
+      </ol>
+
+      <div class="callout">
+        <p><strong class="label">Empty elements</strong></p>
+        <p>
+          <code>&lt;br/&gt;</code> still produces
+          <code>start_element</code> → <code>end_attributes</code> →
+          <code>end_element</code> with no character content in between.
+        </p>
+      </div>
+
+      <h2 id="streaming">Streaming chunks and <code>end</code></h2>
+      <p>
+        Attribute values, character data, comment bodies, and PI data are
+        <strong>streamed</strong>. One logical run may be one call or many.
+        The <code>end</code> flag is true on the chunk that completes the run.
+      </p>
+      <table>
+        <thead>
+          <tr><th>API</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>attribute_value_content(value, end)</code></td>
+            <td>Follows <code>start_attribute</code>; may be empty with <code>end = true</code> at a buffer boundary</td>
+          </tr>
+          <tr>
+            <td><code>characters(text, ignorable, end)</code></td>
+            <td>Entities already expanded; <code>ignorable</code> is whitespace in element content when validation knows that</td>
+          </tr>
+          <tr>
+            <td><code>comment_data(text, end)</code></td>
+            <td>After <code>start_comment</code></td>
+          </tr>
+          <tr>
+            <td><code>pi_data(data, end)</code></td>
+            <td>After <code>pi_target</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        If the first call already has <code>end = true</code>, you may use the
+        slice immediately with no buffering.
+      </p>
+
+      <h2 id="lifetimes">Buffer lifetimes and <code>save_buffers</code></h2>
+      <p>
+        <code>&amp;str</code> arguments are borrowed from the scanner’s working
+        storage. They are valid <strong>only for the duration of the callback</strong>.
+        Before the scanner reuses that storage (for example after a character
+        reference, or at the end of a <code>receive</code> chunk), it calls
+        <code>save_buffers()</code>.
+      </p>
+      <ul class="contract">
+        <li>If you retain text across calls, copy it into owned storage.</li>
+        <li>If you were holding borrowed slices, copy them in <code>save_buffers</code> (or earlier).</li>
+        <li>Ignoring <code>save_buffers</code> while keeping borrows is undefined behaviour from the application’s point of view (dangling views into reused buffers).</li>
+      </ul>
+
+      <h2 id="lexical">Lexical and DTD events</h2>
+      <table>
+        <thead>
+          <tr><th>Event</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>start_cdata</code> / <code>end_cdata</code></td><td>Markers only; text still arrives via <code>characters</code></td></tr>
+          <tr><td><code>start_comment</code> / <code>comment_data</code></td><td>Comment body streamed</td></tr>
+          <tr><td><code>pi_target</code> / <code>pi_data</code></td><td>Processing instruction</td></tr>
+          <tr><td><code>start_entity</code> / <code>end_entity</code></td><td>Lexical expansion of a general entity</td></tr>
+          <tr><td><code>skipped_entity</code></td><td>Entity not expanded (e.g. external disabled)</td></tr>
+          <tr><td><code>start_dtd</code> / <code>end_dtd</code></td><td>DOCTYPE bounds; decls fire in between</td></tr>
+          <tr><td><code>element_decl</code>, <code>attribute_decl</code>, …</td><td>DTD markup declarations</td></tr>
+          <tr><td><code>notation_decl</code>, <code>unparsed_entity_decl</code></td><td>Notation / unparsed entity</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="errors">Errors</h2>
+      <table>
+        <thead>
+          <tr><th>Method</th><th>Contract</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>fatal_error(message)</code></td>
+            <td>Well-formedness (or similar) failure. Returning <code>Err</code> aborts the parse. The default implementation returns <code>Err(ParseError::new(message))</code>.</td>
+          </tr>
+          <tr>
+            <td><code>error(message)</code></td>
+            <td>Recoverable — typically a validity constraint when validation is on. Parsing continues unless you return <code>Err</code>. Default is <code>Ok(())</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        Application code may also return <code>Err</code> from any other
+        handler method to abort early.
+      </p>
+
+      <h2 id="method-index">Method index</h2>
+      <pre><code>set_locator / set_xml11
+start_document / end_document
+start_element / namespace / start_attribute / attribute_value_content / end_attributes
+characters / end_element
+start_comment / comment_data
+start_cdata / end_cdata
+start_dtd / end_dtd
+notation_decl / unparsed_entity_decl / element_decl / attribute_decl
+internal_entity_decl / external_entity_decl
+start_entity / end_entity / skipped_entity
+pi_target / pi_data
+save_buffers
+fatal_error / error</code></pre>
+
+      <h2 id="vs-sax">Compared with SAX</h2>
+      <p>
+        There is no split into <code>ContentHandler</code>,
+        <code>LexicalHandler</code>, and <code>DeclHandler</code> — one trait
+        covers all. There is no <code>Attributes</code> object: attributes are
+        streamed. <code>end_element</code> carries no name. Namespace events
+        are optional and come from a filter stage, not from the scanner itself.
+      </p>
+
+      <p class="footer">
+        Next: <a href="writer.html">XmlWriter</a> ·
+        <a href="cookbook/collect-text.html">Collect text</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>
