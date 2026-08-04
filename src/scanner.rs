@@ -4206,12 +4206,18 @@ impl<'a> Scanner<'a> {
     // ===== Attribute defaults =====
 
     fn apply_attribute_defaults(&mut self, element_name: &str) -> ParseResult<()> {
-        let declared: Option<Vec<(String, crate::dtd::AttDef)>> =
-            self.dtd_model.get_attributes(element_name).cloned();
-        let declared = match declared {
+        let declared_list = match self.dtd_model.get_attributes(element_name) {
             None => return Ok(()),
             Some(d) => d,
         };
+        // Common case: every declared attribute was explicitly specified,
+        // so there's nothing to default and no REQUIRED-but-absent check
+        // to run. Cloning the declared list (String/AttDef allocations) is
+        // wasted work on every element in that case — skip it.
+        if declared_list.iter().all(|(name, _)| self.was_attribute_seen(name)) {
+            return Ok(());
+        }
+        let declared: Vec<(String, crate::dtd::AttDef)> = declared_list.clone();
         for (name, def) in declared {
             if self.was_attribute_seen(&name) {
                 continue;
