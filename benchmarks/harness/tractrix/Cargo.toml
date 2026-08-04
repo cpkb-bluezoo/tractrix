@@ -1,0 +1,17 @@
+[package]
+name = "bench_tractrix"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bench_tractrix"
+path = "src/main.rs"
+
+[dependencies]
+tractrix = { path = "../../.." }
+bytes = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3

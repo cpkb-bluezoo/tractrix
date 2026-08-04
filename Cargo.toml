@@ -12,7 +12,7 @@ homepage = "https://github.com/cpkb-bluezoo/tractrix"
 keywords = ["xml", "parser", "serializer", "streaming", "sax"]
 categories = ["encoding", "parser-implementations"]
 # Keep the ~15MB W3C suite in git/CI, but out of the crates.io package.
-exclude = ["xmlconf/"]
+exclude = ["xmlconf/", "benchmarks/"]
 
 [lib]
 name = "tractrix"

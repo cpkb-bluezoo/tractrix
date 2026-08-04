@@ -1,0 +1,1 @@
+{"parser":"tractrix","config":"ns+dtd","file_count":484,"total_bytes":633980,"iterations":10,"warmup_discarded":1,"wall_times_sec":[9.973837,10.155454,10.188284,10.145192,10.170887,10.048478,10.278089,10.380377,10.070867,10.135550],"median_sec":10.155454,"mb_per_sec":0.060,"peak_rss_bytes":10450616320,"errors":[]}

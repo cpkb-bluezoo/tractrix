@@ -1,0 +1,22 @@
+[package]
+name = "bench_quick_xml"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bench_quick_xml"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to match benchmarks/versions.env (QUICK_XML_VERSION) — bump both together.
+# "encoding" matches what Expat/libxml2/tractrix do by default (transcode
+# non-UTF-8 documents). Note it's still documented as NOT supporting
+# UTF-16BE/LE or ISO-2022-JP — see quick-xml's own Cargo.toml — so those
+# three encodings remain a genuine, permanent quick-xml limitation rather
+# than a benchmark configuration gap.
+quick-xml = { version = "=0.39.0", features = ["encoding"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
