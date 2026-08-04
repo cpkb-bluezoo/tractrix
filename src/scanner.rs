@@ -827,8 +827,21 @@ impl<'a> Scanner<'a> {
         self.seen_attribute_names.iter().any(|n| n == name)
     }
 
-    fn check_entity_expansion_limit(&mut self) -> ParseResult<()> {
-        self.entity_expansion_count += 1;
+    /// `weight` is normally 1 (one reference counted) except at the two call
+    /// sites that materialize a parameter entity's replacement text into a
+    /// buffer (`scan_quoted_literal_with_char_refs`'s "Included in Literal"
+    /// handling, and `expand_parameter_entity_reference`'s buffer swap):
+    /// there, `weight` is the replacement's length. Parameter entities are
+    /// expanded eagerly and recursively at declaration time, so a small
+    /// number of *references* (cheap under a count-only check) can still
+    /// materialize an exponentially large *string* — the classic "billion
+    /// laughs" attack via nested parameter entities. Counting by size at
+    /// those two sites closes that gap while leaving the plain
+    /// reference-count check (general entities in content, which expand
+    /// lazily by re-scanning rather than pre-materializing, so count alone
+    /// already bounds the work) unchanged.
+    fn check_entity_expansion_limit(&mut self, weight: i64) -> ParseResult<()> {
+        self.entity_expansion_count += weight.max(1);
         let expansion_limit = self.settings.entity_expansion_limit as i64;
         if expansion_limit > 0 && self.entity_expansion_count > expansion_limit {
             let msg = format!("Entity expansion limit ({expansion_limit}) exceeded");
@@ -3400,7 +3413,7 @@ impl<'a> Scanner<'a> {
             let msg = format!("Recursive entity reference: &{name};");
             return Err(self.fatal(&msg));
         }
-        self.check_entity_expansion_limit()?;
+        self.check_entity_expansion_limit(1)?;
         Ok(true)
     }
 
@@ -3968,7 +3981,7 @@ impl<'a> Scanner<'a> {
             let msg = format!("Recursive parameter entity reference: %{name};");
             return Err(self.fatal(&msg));
         }
-        self.check_entity_expansion_limit()?;
+        self.check_entity_expansion_limit(replacement_chars.len() as i64)?;
         self.parameter_entity_expansion_stack.push(name.clone());
 
         let saved_buf = std::mem::replace(&mut self.buf, replacement_chars);
@@ -4167,7 +4180,7 @@ impl<'a> Scanner<'a> {
             Some(v) => v,
             None => return Ok(None),
         };
-        self.check_entity_expansion_limit()?;
+        self.check_entity_expansion_limit(replacement.len() as i64)?;
         self.last_pe_reference_end = q + 1;
         Ok(Some(replacement))
     }

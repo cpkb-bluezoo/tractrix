@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-04T19:15:10Z",
+  "generated_at": "2026-08-04T19:31:25Z",
   "files": [
     {"path": "libxml2/test/adjacent-cdata.xml", "sha256": "39d5f92fbb525f982b0f8834ab5a3a31b001a7f85b06e462744d329a409fc2a2", "size": 57, "source": "libxml2", "tier_wf": true, "tier_valid": false},
     {"path": "libxml2/test/attrib.xml", "sha256": "71f5796698b81926bd751ac76a9de8d29ba3146d72a1f936bc1973383323e04a", "size": 474, "source": "libxml2", "tier_wf": true, "tier_valid": false},
@@ -76,8 +76,8 @@
     {"path": "libxml2/test/recurse/good.xml", "sha256": "e1503590ad24e29c5016f0a7e41ecea8672760d74108e59c4b21ff7dcea60c05", "size": 6755, "source": "libxml2", "tier_wf": true, "tier_valid": true},
     {"path": "libxml2/test/recurse/lol_eg.xml", "sha256": "c2a31623c51bb27237862723f4cda8b204deefac329988007f3b6e0c2b569d7e", "size": 224, "source": "libxml2", "tier_wf": true, "tier_valid": false},
     {"path": "libxml2/test/recurse/lol_ep.xml", "sha256": "d9e65f12897f62cf6089738a6cc949b957e3d6330ff83319ba7bbeebba2c0ffe", "size": 226, "source": "libxml2", "tier_wf": true, "tier_valid": false},
-    {"path": "libxml2/test/recurse/lol_ip_content.xml", "sha256": "59699767698df29ed546a153f054d49d96a98988eb9a7a607e89cc89883f3eeb", "size": 80, "source": "libxml2", "tier_wf": true, "tier_valid": true},
-    {"path": "libxml2/test/recurse/lol_ip_value.xml", "sha256": "c7fcb15697c90d9e82376712a64b10df653b9c20401d97b470aa984edb73445e", "size": 94, "source": "libxml2", "tier_wf": true, "tier_valid": true},
+    {"path": "libxml2/test/recurse/lol_ip_content.xml", "sha256": "59699767698df29ed546a153f054d49d96a98988eb9a7a607e89cc89883f3eeb", "size": 80, "source": "libxml2", "tier_wf": true, "tier_valid": false},
+    {"path": "libxml2/test/recurse/lol_ip_value.xml", "sha256": "c7fcb15697c90d9e82376712a64b10df653b9c20401d97b470aa984edb73445e", "size": 94, "source": "libxml2", "tier_wf": true, "tier_valid": false},
     {"path": "libxml2/test/relaxng/302836_0.xml", "sha256": "db5bcb4c71a97d5dc69270bd2429798a43a73f98a7a0ca7c9b4cd3a326327760", "size": 207, "source": "libxml2", "tier_wf": true, "tier_valid": false},
     {"path": "libxml2/test/relaxng/307377_0.xml", "sha256": "558b037e8c16a72c82b80f60b1fc6f9136334d8d95f72d160f04a5a451d847a1", "size": 29, "source": "libxml2", "tier_wf": true, "tier_valid": false},
     {"path": "libxml2/test/relaxng/307377_1.xml", "sha256": "8fdcd2aca1147ac0e9746d8044594e2b05badd8ed90e5c5f634d145d230d18ef", "size": 29, "source": "libxml2", "tier_wf": true, "tier_valid": false},

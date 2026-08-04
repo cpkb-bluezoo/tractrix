@@ -1,10 +1,10 @@
 # Benchmark results
 
-Generated: 2026-08-04T19:17:42Z
+Generated: 2026-08-04T19:32:14Z
 
 Versions: Expat 2.8.2 · libxml2 2.15.3 · quick-xml 0.39.0 · chunk size 32768 bytes · 10 iterations (first discarded as warm-up)
 
-Corpus: 1212 well-formed files (Tier 1) / 484 DTD-validating files (Tier 2), pooled from libxml2's `test/`, quick-xml's `tests/documents/`, and the W3C XML Test Suite (Expat's own referenced suite). Generated 2026-08-04T19:15:10Z. See corpus_manifest.json.
+Corpus: 1212 well-formed files (Tier 1) / 482 DTD-validating files (Tier 2), pooled from libxml2's `test/`, quick-xml's `tests/documents/`, and the W3C XML Test Suite (Expat's own referenced suite). Generated 2026-08-04T19:31:25Z. See corpus_manifest.json.
 
 > **Note:** one or more runs reported parse errors — see the Errors section below. This can mean a genuine divergence between that parser and tractrix's well-formedness/validity oracle (interesting!), not necessarily a broken run.
 
@@ -12,11 +12,11 @@ Corpus: 1212 well-formed files (Tier 1) / 484 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Files | Corpus (MB) | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| expat | ns | no-op sink | 1212 | 3.21 | 0.0339 | 94.7 | 6.4 | **2** (see below) |
-| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 484 | 0.60 | 0.0290 | 20.9 | 10.7 | **63** (see below) |
-| quick-xml | ns | no-op sink | 1212 | 3.21 | 0.0115 | 280.2 | 6.8 | **3** (see below) |
-| tractrix | ns+dtd | no-op sink (DefaultHandler) | 484 | 0.60 | 10.1555 | 0.1 | 9966.5 | 0 |
-| tractrix | ns | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0799 | 40.2 | 9.3 | 0 |
+| expat | ns | no-op sink | 1212 | 3.21 | 0.0336 | 95.5 | 6.4 | **2** (see below) |
+| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 482 | 0.60 | 0.0262 | 23.1 | 8.9 | **61** (see below) |
+| quick-xml | ns | no-op sink | 1212 | 3.21 | 0.0114 | 280.8 | 6.8 | **3** (see below) |
+| tractrix | ns+dtd | no-op sink (DefaultHandler) | 482 | 0.60 | 0.0725 | 8.3 | 7.9 | 0 |
+| tractrix | ns | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0793 | 40.5 | 9.1 | 0 |
 
 
 ## Pathological case (single huge token)
@@ -25,14 +25,14 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 
 | Parser | Config | Document | Peak RSS (MB) | Time (s) |
 |---|---|---|---:|---:|
-| expat | ns | attribute | 259.8 | 0.5405 |
-| expat | ns | text/CDATA | 65.6 | 0.2436 |
-| libxml2 | ns+dtd | attribute | 259.0 | 0.3420 |
-| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3680 |
-| quick-xml | ns | attribute | 131.7 | 0.0561 |
-| quick-xml | ns | text/CDATA | 131.7 | 0.0099 |
-| tractrix | ns | attribute | 66.3 | 0.5678 |
-| tractrix | ns | text/CDATA | 66.2 | 0.4443 |
+| expat | ns | attribute | 259.8 | 0.5316 |
+| expat | ns | text/CDATA | 65.6 | 0.2407 |
+| libxml2 | ns+dtd | attribute | 259.0 | 0.3456 |
+| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3661 |
+| quick-xml | ns | attribute | 131.7 | 0.0573 |
+| quick-xml | ns | text/CDATA | 131.7 | 0.0120 |
+| tractrix | ns | attribute | 66.3 | 0.5768 |
+| tractrix | ns | text/CDATA | 66.3 | 0.4413 |
 
 ## Errors
 
@@ -42,7 +42,7 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 - `benchmarks/vendor/libxml2/test/icu_parse_test.xml`: unknown encoding at line 1
 - `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: unknown encoding at line 1
 
-**libxml2 / ns+dtd** (libxml2.json) — 63 error(s):
+**libxml2 / ns+dtd** (libxml2.json) — 61 error(s):
 
 - `benchmarks/vendor/libxml2/test/bigentname.xml`: No declaration for element doc
  (line 5)
@@ -84,7 +84,7 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
  (line 291)
 - `benchmarks/vendor/libxml2/test/issue626.xml`: No declaration for element e
  (line 12)
-- ... and 43 more
+- ... and 41 more
 
 **quick-xml / ns** (quick-xml.json) — 3 error(s):
 
