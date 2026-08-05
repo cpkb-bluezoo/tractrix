@@ -928,6 +928,16 @@ impl<'a> Scanner<'a> {
     }
 
     fn is_content_stop(&self, c: char) -> bool {
+        // Printable ASCII is always a legal literal character in both XML
+        // 1.0 and 1.1 (is_restricted_char_xml11's ranges never touch
+        // 0x20-0x7E), and it's the overwhelming common case in real text
+        // content — so for it, checking the four actual stop characters is
+        // a complete, definitive answer. No need to fall through to
+        // is_legal_literal_char's Unicode-range logic just to reconfirm
+        // "yes, this is fine" for every ordinary character in the run.
+        if (' '..='~').contains(&c) {
+            return c == '<' || c == '&' || c == ']' || c == '>';
+        }
         c == '<'
             || c == '&'
             || c == ']'
@@ -1501,6 +1511,12 @@ impl<'a> Scanner<'a> {
     }
 
     fn is_attr_stop(&self, c: char, quote: char) -> bool {
+        // See is_content_stop: printable ASCII is always legal, so the
+        // three real stop characters are a complete answer without
+        // touching is_legal_literal_char at all.
+        if (' '..='~').contains(&c) {
+            return c == quote || c == '&' || c == '<';
+        }
         c == quote
             || c == '&'
             || c == '<'
