@@ -204,16 +204,24 @@ treating as bugs:
   its `encoding` feature enabled (which this harness does) — its own
   `Cargo.toml` documents this as a permanent, known non-compliance, not an
   oversight.
-- **libxml2** rejects a number of Tier 2 documents with "No declaration for
-  element/attribute X" that tractrix's oracle accepted as valid — most
-  visibly libxml2's own `test/c14n/*` fixtures, whose internal DTD subsets
-  are minimal (built for entity/attribute-default testing, not full
-  validation). Whether this reflects a gap in tractrix's `VC: Element
-  Valid`/`VC: Attribute Value Type` enforcement for minimal/partial DTD
-  subsets, or a legitimately different (and defensible) reading of those
-  specific fixtures, is an open question this benchmark surfaced rather
-  than answered — worth a closer look separately, not something this
-  harness should paper over.
+- **libxml2** used to appear to reject ~60 Tier 2 documents that tractrix's
+  oracle accepted as valid. This was a harness bug, not a tractrix gap: the
+  oracle (and the `ns+dtd` timing config) drove tractrix through
+  `DefaultHandler`, whose `error()` is a correct no-op per SAX/Xerces
+  convention (validity-constraint violations are recoverable, and the
+  application decides what to do with them) — but that also means a
+  `DefaultHandler`-based harness can never distinguish a validity error from
+  a clean parse. `src/scanner.rs`'s validator was firing `VC: Element
+  Valid`/`VC: Attribute Value Type` etc. correctly all along; the harness
+  just wasn't listening. Fixed by swapping in a small `RecordingHandler`
+  (`harness/tractrix/src/main.rs`) that tracks whether `error()` fired,
+  otherwise identical to `DefaultHandler`. After the fix, only two libxml2
+  divergences remain, both expected: `test/xmlid/id_err2.xml`, where
+  libxml2 enforces the separate W3C xml:id Recommendation (an `xml:id`
+  attribute must behave as type ID regardless of its DTD declaration) —
+  outside core XML 1.0 validation, which tractrix correctly doesn't apply;
+  and `japanese/weekly-iso-2022-jp.xml`, the same unsupported-encoding gap
+  already noted above for Expat/quick-xml.
 - **tractrix's `skip` config** rejects one Tier 1 document,
   `libxml2/test/valid/ns.xml`, with "Element prefix is not bound to a
   namespace URI". That file supplies its `xmlns:a`/`xmlns:b` bindings via

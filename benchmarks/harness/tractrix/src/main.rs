@@ -25,9 +25,30 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use tractrix::{
-    DefaultHandler, DoctypeHandling, EntityResolver, FeatureSet, FileEntityResolver,
-    NamespaceFilter, Parser,
+    DoctypeHandling, EntityResolver, FeatureSet, FileEntityResolver, NamespaceFilter, ParseResult,
+    Parser, XmlHandler,
 };
+
+/// A no-op sink like `DefaultHandler`, except it remembers whether
+/// `error()` fired. `error()` reports recoverable validity-constraint
+/// violations (SAX/Xerces convention: non-fatal, the application decides
+/// what to do with them) — `DefaultHandler` correctly no-ops it, but that
+/// means a plain `DefaultHandler`-based harness can never tell a validity
+/// error from a clean parse. This is what makes the ns+dtd config (and the
+/// oracle usage in assemble_corpus.sh) actually notice validation failures
+/// instead of silently reporting every validating parse as successful.
+struct RecordingHandler {
+    error: Option<String>,
+}
+
+impl XmlHandler for RecordingHandler {
+    fn error(&mut self, message: &str) -> ParseResult<()> {
+        if self.error.is_none() {
+            self.error = Some(message.to_string());
+        }
+        Ok(())
+    }
+}
 
 struct Doc {
     path: String,
@@ -68,7 +89,7 @@ fn parse_one(
     features: &FeatureSet,
     use_dtd_resolver: bool,
 ) -> Result<(), String> {
-    let mut app = DefaultHandler;
+    let mut app = RecordingHandler { error: None };
     let mut filter = NamespaceFilter::new(&mut app, false);
 
     let resolver: Option<Box<dyn EntityResolver>> = if use_dtd_resolver {
@@ -94,6 +115,11 @@ fn parse_one(
         offset = end;
     }
     parser.close().map_err(|e| format!("{e}"))?;
+    drop(parser);
+    drop(filter);
+    if let Some(msg) = app.error {
+        return Err(msg);
+    }
     Ok(())
 }
 

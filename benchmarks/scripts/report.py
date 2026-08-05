@@ -19,7 +19,7 @@ HANDLER_KIND = {
     "expat": "no-op sink",
     "quick-xml": "no-op sink",
     "libxml2": "default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c)",
-    "tractrix": "no-op sink (DefaultHandler)",
+    "tractrix": "no-op sink (RecordingHandler — tracks error() only)",
 }
 
 
