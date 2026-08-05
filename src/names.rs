@@ -26,20 +26,32 @@ use std::rc::Rc;
 #[derive(Debug, Default)]
 pub struct PackedName {
     pool: HashSet<Rc<str>>,
+    /// Reused across `intern_range` calls as the lookup key, so a cache hit
+    /// (the common case — names repeat constantly) allocates nothing at
+    /// all: only a genuine miss pays for `Rc::from`, which is the one
+    /// allocation actually storing a new distinct name.
+    scratch: String,
 }
 
 impl PackedName {
     pub fn new() -> Self {
         Self {
             pool: HashSet::with_capacity(512),
+            scratch: String::new(),
         }
     }
 
     /// Interns a name from a character-array range, returning a canonical
     /// `Rc<str>`. Mirrors `PackedName.internRange`.
     pub fn intern_range(&mut self, buf: &[char], start: usize, len: usize) -> Rc<str> {
-        let s: String = buf[start..start + len].iter().collect();
-        self.intern_str(&s)
+        self.scratch.clear();
+        self.scratch.extend(buf[start..start + len].iter().copied());
+        if let Some(existing) = self.pool.get(self.scratch.as_str()) {
+            return Rc::clone(existing);
+        }
+        let owned: Rc<str> = Rc::from(self.scratch.as_str());
+        self.pool.insert(Rc::clone(&owned));
+        owned
     }
 
     /// Interns a `&str`, returning a canonical `Rc<str>`.
