@@ -1,6 +1,6 @@
 # Benchmark results
 
-Generated: 2026-08-05T06:06:18Z
+Generated: 2026-08-05T06:13:23Z
 
 Versions: Expat 2.8.2 · libxml2 2.15.3 · quick-xml 0.39.0 · chunk size 32768 bytes · 10 iterations (first discarded as warm-up)
 
@@ -40,30 +40,30 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 
 **expat / ns** (expat.json) — 2 error(s):
 
-- `benchmarks/vendor/libxml2/test/icu_parse_test.xml`: unknown encoding at line 1
-- `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: unknown encoding at line 1
+- `vendor/libxml2/test/icu_parse_test.xml`: unknown encoding at line 1
+- `vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: unknown encoding at line 1
 
 **libxml2 / ns+dtd** (libxml2.json) — 2 error(s):
 
-- `benchmarks/vendor/libxml2/test/xmlid/id_err2.xml`: xml:id : attribute type should be ID
+- `vendor/libxml2/test/xmlid/id_err2.xml`: xml:id : attribute type should be ID
  (line 3)
-- `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: Unsupported encoding: iso-2022-jp
+- `vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: Unsupported encoding: iso-2022-jp
  (line 1)
 
 **quick-xml / ns** (quick-xml.json) — 3 error(s):
 
-- `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/pr-xml-little-endian.xml`: ill-formed document: entity or character reference not closed: `;` not found before end of input
-- `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/pr-xml-utf-16.xml`: ill-formed document: entity or character reference not closed: `;` not found before end of input
-- `benchmarks/vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: ill-formed document: expected `</$N4pK\;EMM$N:n@.</P>`, but `</予定項目>` was found
+- `vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/pr-xml-little-endian.xml`: ill-formed document: entity or character reference not closed: `;` not found before end of input
+- `vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/pr-xml-utf-16.xml`: ill-formed document: entity or character reference not closed: `;` not found before end of input
+- `vendor/w3c-xmltest/XML-Test-Suite/xmlconf/japanese/weekly-iso-2022-jp.xml`: ill-formed document: expected `</$N4pK\;EMM$N:n@.</P>`, but `</予定項目>` was found
 
 **tractrix / skip** (tractrix-skip.json) — 1 error(s):
 
-- `benchmarks/vendor/libxml2/test/valid/ns.xml`: NSC: Element prefix "a" is not bound to a namespace URI
+- `vendor/libxml2/test/valid/ns.xml`: NSC: Element prefix "a" is not bound to a namespace URI
 
 **libxml2 / ns+dtd** (pathological-libxml2-attribute.json) — 1 error(s):
 
-- `benchmarks/corpus_pathological/huge_attribute.xml`: Validation failed: no DTD found ! (line 2033603)
+- `corpus_pathological/huge_attribute.xml`: Validation failed: no DTD found ! (line 2033603)
 
 **libxml2 / ns+dtd** (pathological-libxml2-text.json) — 1 error(s):
 
-- `benchmarks/corpus_pathological/huge_text.xml`: Validation failed: no DTD found ! (line 2)
+- `corpus_pathological/huge_text.xml`: Validation failed: no DTD found ! (line 2)

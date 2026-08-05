@@ -53,6 +53,19 @@ run_one() {
     "$@" > "$RESULTS_DIR/$out"
     local rc=$?
     set -e
+    # File lists are absolute (harnesses need real paths to open the
+    # corpus), so error messages embed the full local path — including the
+    # username. Strip the BENCH_DIR prefix before this becomes a committed
+    # result file; corpus_manifest.json already does the same relative to
+    # $BENCH_DIR/vendor.
+    python3 -c '
+import sys
+path, prefix = sys.argv[1], sys.argv[2] + "/"
+with open(path) as f:
+    content = f.read()
+with open(path, "w") as f:
+    f.write(content.replace(prefix, ""))
+' "$RESULTS_DIR/$out" "$BENCH_DIR"
     if [ "$rc" -ne 0 ]; then
         local n
         n="$(jq '.errors | length' "$RESULTS_DIR/$out" 2>/dev/null || echo '?')"
