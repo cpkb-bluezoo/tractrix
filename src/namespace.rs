@@ -425,7 +425,8 @@ impl XmlHandler for NamespaceFilter<'_> {
 
     fn start_element(&mut self, q_name: &str) -> ParseResult<()> {
         self.tracker.push_context();
-        self.element_qname = q_name.to_string();
+        self.element_qname.clear();
+        self.element_qname.push_str(q_name);
         self.pending_attr_qnames.clear();
         self.validate_qname(q_name)?;
         self.delegate.start_element(q_name)
@@ -444,12 +445,18 @@ impl XmlHandler for NamespaceFilter<'_> {
         declared: bool,
         specified: bool,
     ) -> ParseResult<()> {
-        self.current_attr_name = name.to_string();
-        self.current_attr_type = ty.to_string();
-        self.current_attr_declared = declared;
-        self.current_attr_specified = specified;
         self.current_is_namespace_decl = name == "xmlns" || name.starts_with("xmlns:");
         if self.current_is_namespace_decl {
+            // Only the xmlns-declaration path reads these back (in
+            // attribute_value_content / declare_namespace) — the common
+            // case below passes name/ty straight through without storing
+            // them, so allocating copies here would be pure waste.
+            self.current_attr_name.clear();
+            self.current_attr_name.push_str(name);
+            self.current_attr_type.clear();
+            self.current_attr_type.push_str(ty);
+            self.current_attr_declared = declared;
+            self.current_attr_specified = specified;
             self.value_first_chunk = true;
             Ok(())
         } else {
@@ -500,7 +507,10 @@ impl XmlHandler for NamespaceFilter<'_> {
         self.element_qname = elem;
 
         let attrs = std::mem::take(&mut self.pending_attr_qnames);
-        let mut expanded: Vec<(String, String)> = Vec::with_capacity(attrs.len());
+        // Borrowed straight from `attrs`/`self.tracker` — this is a
+        // per-element scratch list, never read after this loop, so there's
+        // nothing to gain by copying into owned Strings.
+        let mut expanded: Vec<(&str, &str)> = Vec::with_capacity(attrs.len());
         for qn in attrs.iter() {
             let colon = match qn.find(':') {
                 Some(c) => c,
@@ -517,17 +527,15 @@ impl XmlHandler for NamespaceFilter<'_> {
                     return self.delegate.fatal_error(&msg);
                 }
                 Some(uri) => {
-                    let uri_s = uri.to_string();
-                    let local_s = local.to_string();
-                    if expanded.iter().any(|(u, l)| *u == uri_s && *l == local_s) {
+                    if expanded.iter().any(|(u, l)| *u == uri && *l == local) {
                         let msg = format!(
-                            "NSC: Duplicate attribute by expanded name ({{{uri_s}}}{local_s}) — \
+                            "NSC: Duplicate attribute by expanded name ({{{uri}}}{local}) — \
                              attributes must be unique by namespace URI + local name"
                         );
                         self.pending_attr_qnames = attrs;
                         return self.delegate.fatal_error(&msg);
                     }
-                    expanded.push((uri_s, local_s));
+                    expanded.push((uri, local));
                 }
             }
         }
