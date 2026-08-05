@@ -54,11 +54,10 @@
       </p>
 
       <h2 id="pipeline">Pipeline</h2>
-      <pre class="pipeline" aria-label="Tractrix pipeline">bytes ──▶ ExternalEntityDecoder ──▶ Scanner ──▶ (NamespaceFilter?) ──▶ XmlHandler
-           BOM, decl, charset,            WF + DTD                   xmlns → namespace
-           line endings                   + validation               events
-
-XmlWriter ──▶ bytes   (indent · charset/BOM · XML 1.1 · standalone DTD)</pre>
+      <figure class="diagram">
+        <img src="assets/pipeline.svg" alt="Bytes flow through ExternalEntityDecoder, Scanner, and an optional NamespaceFilter to reach XmlHandler; XmlWriter runs the reverse direction, events to bytes.">
+        <figcaption>Parsing runs bytes to events left to right; <code>XmlWriter</code> runs the reverse direction, independently of the parser.</figcaption>
+      </figure>
 
       <h2 id="reading-order">Reading order</h2>
       <ol class="contract">

@@ -45,10 +45,10 @@
       </header>
 
       <h2 id="parse-pipeline">Parse pipeline</h2>
-      <pre class="pipeline">Parser
-  ├── ExternalEntityDecoder   bytes → chars (BOM, XML/text decl, charset, EOL)
-  └── Scanner                 chars → XmlHandler events (WF, DTD, validation)
-        └── optional NamespaceFilter   xmlns attrs → namespace() events</pre>
+      <figure class="diagram">
+        <img src="assets/architecture-diagram.svg" alt="Parser owns ExternalEntityDecoder and Scanner directly; NamespaceFilter is not owned by Parser, it wraps the caller's own handler, and Scanner's events either flow through it or bypass it entirely.">
+        <figcaption><code>Parser</code> owns the decoder and scanner directly; <code>NamespaceFilter</code> wraps your handler instead — it's never a field on <code>Parser</code>, so events bypass it entirely when you don't use one.</figcaption>
+      </figure>
 
       <table>
         <thead>

@@ -21,11 +21,9 @@ stream, no blocking I/O, minimal allocation. It is designed for environments
 where XML arrives as a byte stream (network sockets, chunked HTTP, async
 readers) and the consumer processes events as they appear.
 
-```text
-bytes ──▶ ExternalEntityDecoder ──▶ Scanner ──▶ (NamespaceFilter?) ──▶ XmlHandler
-           (BOM, XML/text decl,       (WF + DTD        (xmlns → namespace
-            charset, line endings)      + validation)    events)
-```
+<p align="center">
+  <img src="docs/assets/pipeline.svg" alt="Bytes flow through ExternalEntityDecoder, Scanner, and an optional NamespaceFilter to reach XmlHandler; XmlWriter runs the reverse direction, events to bytes.">
+</p>
 
 ## Push API
 
