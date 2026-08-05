@@ -26,7 +26,7 @@ pub const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
 
 #[derive(Default)]
 struct Scope {
-    bindings: HashMap<String, Rc<str>>,
+    bindings: HashMap<Rc<str>, Rc<str>>,
     declaration_count: usize,
 }
 
@@ -37,7 +37,7 @@ struct Scope {
 pub struct NamespaceScopeTracker {
     scopes: Vec<Scope>,
     scope_depth: isize,
-    active_bindings: HashMap<String, Rc<str>>,
+    active_bindings: HashMap<Rc<str>, Rc<str>>,
     intern_pool: Option<InternedStringPool>,
 }
 
@@ -90,7 +90,7 @@ impl NamespaceScopeTracker {
         }
         let depth = self.scope_depth as usize;
         if self.scopes[depth].declaration_count > 0 {
-            let prefixes: Vec<String> = self.scopes[depth].bindings.keys().cloned().collect();
+            let prefixes: Vec<Rc<str>> = self.scopes[depth].bindings.keys().cloned().collect();
             for prefix in prefixes {
                 let outer = self.find_binding_in_outer_scopes(&prefix, self.scope_depth - 1);
                 match outer {
@@ -116,9 +116,17 @@ impl NamespaceScopeTracker {
         if scope.bindings.get(prefix) == Some(&uri) {
             return false;
         }
-        scope.bindings.insert(prefix.to_string(), Rc::clone(&uri));
+        // Same interning pool as the URI above: prefixes repeat just as
+        // much (a handful of distinct prefixes redeclared at many
+        // elements), so a hit here is a refcount bump instead of a fresh
+        // String allocation on every declaration.
+        let prefix: Rc<str> = match &mut self.intern_pool {
+            Some(pool) => pool.intern(prefix),
+            None => Rc::from(prefix),
+        };
+        scope.bindings.insert(Rc::clone(&prefix), Rc::clone(&uri));
         scope.declaration_count += 1;
-        self.active_bindings.insert(prefix.to_string(), uri);
+        self.active_bindings.insert(prefix, uri);
         true
     }
 
