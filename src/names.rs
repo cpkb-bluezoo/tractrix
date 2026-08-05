@@ -67,9 +67,14 @@ impl PackedName {
 
 /// General purpose string interning pool. Mirrors Gonzalez
 /// `InternedStringPool` (used for namespace URIs).
+///
+/// Stores `Rc<str>` for the same reason as `PackedName`: a cache hit is a
+/// refcount bump, not a full string copy. Matters most for documents that
+/// redeclare the same namespace URI many times (e.g. independently
+/// generated XML fragments each carrying their own `xmlns="..."`).
 #[derive(Debug, Default)]
 pub struct InternedStringPool {
-    pool: HashSet<String>,
+    pool: HashSet<Rc<str>>,
 }
 
 impl InternedStringPool {
@@ -79,13 +84,13 @@ impl InternedStringPool {
         }
     }
 
-    /// Interns a `&str`, returning a canonical `String`.
-    pub fn intern(&mut self, s: &str) -> String {
+    /// Interns a `&str`, returning a canonical `Rc<str>`.
+    pub fn intern(&mut self, s: &str) -> Rc<str> {
         if let Some(existing) = self.pool.get(s) {
-            return existing.clone();
+            return Rc::clone(existing);
         }
-        let owned = s.to_string();
-        self.pool.insert(owned.clone());
+        let owned: Rc<str> = Rc::from(s);
+        self.pool.insert(Rc::clone(&owned));
         owned
     }
 

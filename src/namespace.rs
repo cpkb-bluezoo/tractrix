@@ -10,6 +10,7 @@
 //! into [`XmlHandler::namespace`] events, applying the Namespace Constraints.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::error::ParseResult;
 use crate::handler::XmlHandler;
@@ -25,7 +26,7 @@ pub const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
 
 #[derive(Default)]
 struct Scope {
-    bindings: HashMap<String, String>,
+    bindings: HashMap<String, Rc<str>>,
     declaration_count: usize,
 }
 
@@ -36,7 +37,7 @@ struct Scope {
 pub struct NamespaceScopeTracker {
     scopes: Vec<Scope>,
     scope_depth: isize,
-    active_bindings: HashMap<String, String>,
+    active_bindings: HashMap<String, Rc<str>>,
     intern_pool: Option<InternedStringPool>,
 }
 
@@ -52,7 +53,12 @@ impl NamespaceScopeTracker {
             scopes: Vec::new(),
             scope_depth: -1,
             active_bindings: HashMap::new(),
-            intern_pool: None,
+            // On by default: every declare_prefix call goes through this,
+            // and once InternedStringPool returns Rc<str> a hit is a
+            // refcount bump — there's no document shape where this is
+            // worse than the uninterned fallback, only ones where it's a
+            // real win (any URI redeclared more than once).
+            intern_pool: Some(InternedStringPool::new()),
         };
         t.push_context();
         t.declare_prefix("xml", XML_NAMESPACE_URI);
@@ -101,16 +107,16 @@ impl NamespaceScopeTracker {
     }
 
     pub fn declare_prefix(&mut self, prefix: &str, uri: &str) -> bool {
-        let uri = match &mut self.intern_pool {
+        let uri: Rc<str> = match &mut self.intern_pool {
             Some(pool) => pool.intern(uri),
-            None => uri.to_string(),
+            None => Rc::from(uri),
         };
         let depth = self.scope_depth as usize;
         let scope = &mut self.scopes[depth];
         if scope.bindings.get(prefix) == Some(&uri) {
             return false;
         }
-        scope.bindings.insert(prefix.to_string(), uri.clone());
+        scope.bindings.insert(prefix.to_string(), Rc::clone(&uri));
         scope.declaration_count += 1;
         self.active_bindings.insert(prefix.to_string(), uri);
         true
@@ -120,7 +126,7 @@ impl NamespaceScopeTracker {
     /// counts as unbound per XML Namespaces 1.1).
     pub fn get_uri(&self, prefix: &str) -> Option<&str> {
         match self.active_bindings.get(prefix) {
-            Some(uri) if !uri.is_empty() => Some(uri.as_str()),
+            Some(uri) if !uri.is_empty() => Some(uri.as_ref()),
             _ => None,
         }
     }
@@ -134,11 +140,11 @@ impl NamespaceScopeTracker {
         self.declare_prefix("xmlns", XMLNS_NAMESPACE_URI);
     }
 
-    fn find_binding_in_outer_scopes(&self, prefix: &str, max_depth: isize) -> Option<String> {
+    fn find_binding_in_outer_scopes(&self, prefix: &str, max_depth: isize) -> Option<Rc<str>> {
         let mut i = max_depth;
         while i >= 0 {
             if let Some(uri) = self.scopes[i as usize].bindings.get(prefix) {
-                return Some(uri.clone());
+                return Some(Rc::clone(uri));
             }
             i -= 1;
         }
