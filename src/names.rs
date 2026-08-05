@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Name interning pools.
+//! Name interning pool.
 //!
-//! Ported from Gonzalez `PackedName.java` and `InternedStringPool.java`.
+//! Ported from Gonzalez `PackedName.java`.
 //!
 //! In Java these pools exist to avoid a `new String(...)` allocation for every
 //! occurrence of a repeated element/attribute name, and to give callers a
@@ -65,37 +65,3 @@ impl PackedName {
     }
 }
 
-/// General purpose string interning pool. Mirrors Gonzalez
-/// `InternedStringPool` (used for namespace URIs).
-///
-/// Stores `Rc<str>` for the same reason as `PackedName`: a cache hit is a
-/// refcount bump, not a full string copy. Matters most for documents that
-/// redeclare the same namespace URI many times (e.g. independently
-/// generated XML fragments each carrying their own `xmlns="..."`).
-#[derive(Debug, Default)]
-pub struct InternedStringPool {
-    pool: HashSet<Rc<str>>,
-}
-
-impl InternedStringPool {
-    pub fn new() -> Self {
-        Self {
-            pool: HashSet::with_capacity(256),
-        }
-    }
-
-    /// Interns a `&str`, returning a canonical `Rc<str>`.
-    pub fn intern(&mut self, s: &str) -> Rc<str> {
-        if let Some(existing) = self.pool.get(s) {
-            return Rc::clone(existing);
-        }
-        let owned: Rc<str> = Rc::from(s);
-        self.pool.insert(Rc::clone(&owned));
-        owned
-    }
-
-    /// Clears all interned strings from the pool.
-    pub fn clear(&mut self) {
-        self.pool.clear();
-    }
-}

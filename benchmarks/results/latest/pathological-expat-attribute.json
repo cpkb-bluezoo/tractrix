@@ -1,1 +1,1 @@
-{"parser":"expat","config":"ns","file_count":1,"total_bytes":67108919,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.564976],"median_sec":0.564976,"mb_per_sec":113.279,"peak_rss_bytes":272400384,"errors":[]}
+{"parser":"expat","config":"ns","file_count":1,"total_bytes":67108919,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.570864],"median_sec":0.570864,"mb_per_sec":112.111,"peak_rss_bytes":272416768,"errors":[]}
