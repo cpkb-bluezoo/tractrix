@@ -98,6 +98,9 @@ pub struct Scanner<'a> {
     buf: Vec<char>,
     pos: usize,
     limit: usize,
+    /// Reused across `slice_and` calls to avoid a fresh allocation for
+    /// every text/attribute-value/comment/PI/CDATA chunk.
+    scratch: String,
 
     in_start_tag: bool,
     in_attribute_value: bool,
@@ -401,6 +404,7 @@ impl<'a> Scanner<'a> {
             buf: vec!['\u{0}'; INITIAL_CAPACITY],
             pos: 0,
             limit: 0,
+            scratch: String::new(),
             in_start_tag: false,
             in_attribute_value: false,
             pending_quote: '\u{0}',
@@ -680,6 +684,26 @@ impl<'a> Scanner<'a> {
 
     fn slice(&self, start: usize, end: usize) -> String {
         self.buf[start..end].iter().collect()
+    }
+
+    /// Hot-path equivalent of `slice` for callers that only need the text
+    /// transiently (text runs, attribute-value chunks, comment/PI/CDATA
+    /// data): reuses `self.scratch`'s allocation across calls instead of
+    /// allocating a fresh `String` every time.
+    fn slice_and<F>(&mut self, start: usize, end: usize, f: F) -> ParseResult<()>
+    where
+        F: FnOnce(&mut Self, &str) -> ParseResult<()>,
+    {
+        self.scratch.clear();
+        self.scratch.extend(self.buf[start..end].iter().copied());
+        // `chunk` is a plain local once taken out of `self` (mem::take is
+        // O(1), no allocation), so `f(self, &chunk)` has no overlapping
+        // borrows even though `f` takes `&mut Self`. Putting it back after
+        // preserves its capacity for the next call.
+        let chunk = std::mem::take(&mut self.scratch);
+        let result = f(self, &chunk);
+        self.scratch = chunk;
+        result
     }
 
     // ===== Whole-DTD end-of-document checks =====
@@ -1034,11 +1058,14 @@ impl<'a> Scanner<'a> {
     }
 
     fn emit_content_run(&mut self, start: usize, end_idx: usize, end: bool, is_ws: bool) -> ParseResult<()> {
-        let s = self.slice(start, end_idx);
+        self.slice_and(start, end_idx, |this, s| this.emit_content_run_str(s, end, is_ws))
+    }
+
+    fn emit_content_run_str(&mut self, s: &str, end: bool, is_ws: bool) -> ParseResult<()> {
         if self.validation_enabled {
-            self.record_text_for_validation(&s, is_ws)?;
+            self.record_text_for_validation(s, is_ws)?;
         }
-        self.handler.characters(&s, is_ws, end)
+        self.handler.characters(s, is_ws, end)
     }
 
     fn emit_content_empty(&mut self, end: bool, is_ws: bool) -> ParseResult<()> {
@@ -1493,8 +1520,9 @@ impl<'a> Scanner<'a> {
             }
             if self.pos >= self.limit {
                 if self.pos > run_start {
-                    let s = self.slice(run_start, self.pos);
-                    self.emit_attribute_value_content(&s, false)?;
+                    self.slice_and(run_start, self.pos, |this, s| {
+                        this.emit_attribute_value_content(s, false)
+                    })?;
                     self.attr_value_run_open = true;
                 }
                 return Ok(false);
@@ -1508,8 +1536,9 @@ impl<'a> Scanner<'a> {
             }
             if self.buf[self.pos] == quote {
                 if self.pos > run_start {
-                    let s = self.slice(run_start, self.pos);
-                    self.emit_attribute_value_content(&s, true)?;
+                    self.slice_and(run_start, self.pos, |this, s| {
+                        this.emit_attribute_value_content(s, true)
+                    })?;
                 } else {
                     self.emit_attribute_value_content("", true)?;
                 }
@@ -1520,8 +1549,9 @@ impl<'a> Scanner<'a> {
             // '&'
             let amp_pos = self.pos;
             if amp_pos > run_start {
-                let s = self.slice(run_start, amp_pos);
-                self.emit_attribute_value_content(&s, false)?;
+                self.slice_and(run_start, amp_pos, |this, s| {
+                    this.emit_attribute_value_content(s, false)
+                })?;
                 self.attr_value_run_open = true;
             }
             let decoded = match self.decode_entity_ref()? {
@@ -1697,16 +1727,14 @@ impl<'a> Scanner<'a> {
             }
             if p >= self.limit || p + 2 >= self.limit {
                 if p > self.pos {
-                    let s = self.slice(self.pos, p);
-                    self.handler.comment_data(&s, false)?;
+                    self.slice_and(self.pos, p, |this, s| this.handler.comment_data(s, false))?;
                     self.pos = p;
                 }
                 return Ok(false);
             }
             if self.buf[p + 1] == '-' {
                 if self.buf[p + 2] == '>' {
-                    let s = self.slice(self.pos, p);
-                    self.handler.comment_data(&s, true)?;
+                    self.slice_and(self.pos, p, |this, s| this.handler.comment_data(s, true))?;
                     self.pos = p + 3;
                     return Ok(true);
                 }
@@ -1775,14 +1803,20 @@ impl<'a> Scanner<'a> {
     }
 
     fn emit_cdata_chunk(&mut self, start: usize, end: usize, is_end: bool) -> ParseResult<()> {
-        let s = self.slice(start, end);
+        let non_empty = end > start;
+        self.slice_and(start, end, |this, s| {
+            this.emit_cdata_chunk_str(s, non_empty, is_end)
+        })
+    }
+
+    fn emit_cdata_chunk_str(&mut self, s: &str, non_empty: bool, is_end: bool) -> ParseResult<()> {
         // CDATA never matches the nonterminal S (Sun xmlconf empty / not-sa14):
         // even whitespace-only CDATA is character data for Element Valid, not
         // ignorable separator whitespace between children.
-        if end > start && self.validation_enabled {
-            self.record_text_for_validation(&s, false)?;
+        if non_empty && self.validation_enabled {
+            self.record_text_for_validation(s, false)?;
         }
-        self.handler.characters(&s, false, is_end)
+        self.handler.characters(s, false, is_end)
     }
 
     fn scan_pi(&mut self, tag_start: usize) -> ParseResult<bool> {
@@ -1846,15 +1880,13 @@ impl<'a> Scanner<'a> {
             }
             if p >= self.limit || p + 1 >= self.limit {
                 if p > self.pos {
-                    let s = self.slice(self.pos, p);
-                    self.handler.pi_data(&s, false)?;
+                    self.slice_and(self.pos, p, |this, s| this.handler.pi_data(s, false))?;
                     self.pos = p;
                 }
                 return Ok(false);
             }
             if self.buf[p + 1] == '>' {
-                let s = self.slice(self.pos, p);
-                self.handler.pi_data(&s, true)?;
+                self.slice_and(self.pos, p, |this, s| this.handler.pi_data(s, true))?;
                 self.pos = p + 2;
                 return Ok(true);
             }
