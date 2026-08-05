@@ -81,6 +81,13 @@ a:hover {
   color: var(--accent);
 }
 
+.nav .brand-mark {
+  height: 1.5em;
+  width: auto;
+  vertical-align: -0.4em;
+  margin-right: 0.35em;
+}
+
 .nav .tag {
   font-size: 0.8rem;
   color: var(--muted);

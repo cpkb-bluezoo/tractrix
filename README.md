@@ -1,5 +1,9 @@
 # Tractrix
 
+<p align="center">
+  <img src="docs/assets/tractrix-logo.svg" alt="Tractrix" width="240">
+</p>
+
 A non-blocking, push-model XML parser and serializer for Rust. Ported from the
 [Gonzalez](https://github.com/cpkb-bluezoo/gonzalez) streaming XML scanner and
 writer.
