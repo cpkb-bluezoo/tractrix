@@ -102,11 +102,32 @@ let mut parser = Parser::new(
         </p>
       </div>
 
-      <h2 id="doctype">Disallowing DOCTYPE</h2>
+      <h2 id="doctype">Controlling DOCTYPE handling</h2>
       <p>
-        Set <code>disallow_doctype_decl = true</code> to reject any DTD
-        declaration outright — useful for untrusted feeds that must be
-        document-only.
+        <code>doctype_handling</code> has three settings. Set it to
+        <code>DoctypeHandling::Disallow</code> to reject any DTD declaration
+        outright — useful for untrusted feeds that must be document-only.
+        The standard SAX/Xerces boolean feature
+        <code>disallow_doctype_decl = true</code> does the same thing.
+      </p>
+      <p>
+        <code>DoctypeHandling::Skip</code> is a different trade-off: the
+        DOCTYPE is recognized and skipped past (bracket/quote/comment/PI-aware)
+        rather than rejected, but its contents are never parsed — no entity
+        table, no attribute defaults, no validation. An entity reference the
+        DTD would otherwise have declared is reported via
+        <code>XmlHandler::skipped_entity</code> instead of being expanded or
+        treated as a well-formedness error. This is an explicit reduction in
+        checking for the DTD's contents specifically (the rest of the
+        document is still fully checked) — the same guarantee level parsers
+        without DTD support at all (e.g. quick-xml) already operate under.
+        Use it when an application doesn't need entities or attribute
+        defaults and wants to skip that work entirely, on trusted input.
+      </p>
+      <p>
+        <code>DoctypeHandling::Process</code> is the default: full parsing
+        and use of the DTD's declarations, with validation on top if
+        <code>validation</code> is also enabled.
       </p>
 
       <p class="footer">

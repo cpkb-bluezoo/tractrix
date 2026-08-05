@@ -13,6 +13,7 @@
 //! `xmlns` as a plain attribute.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::decoder;
 use crate::dtd::{
@@ -21,7 +22,7 @@ use crate::dtd::{
 };
 use crate::entity::{EntityResolver, ExternalId};
 use crate::error::{ParseError, ParseResult};
-use crate::features::ScannerSettings;
+use crate::features::{DoctypeHandling, ScannerSettings};
 use crate::handler::XmlHandler;
 use crate::locator::DocumentLocator;
 use crate::names::PackedName;
@@ -63,7 +64,7 @@ struct ExtPe {
 struct PendingDecls {
     entities: HashMap<String, String>,
     external_names: HashMap<String, ExtEntity>,
-    param_entities: HashMap<String, String>,
+    param_entities: HashMap<String, Rc<[char]>>,
     param_external_names: HashMap<String, ExtPe>,
 }
 
@@ -131,6 +132,10 @@ pub struct Scanner<'a> {
     doctype_name_pending: Option<String>,
     doctype_pending: Option<PendingDecls>,
 
+    // `DoctypeHandling::Skip` resumable state (see skip_doctype_subset_inner).
+    in_skipped_declaration: bool,
+    skip_decl_quote: Option<char>,
+
     doctype_external_public_id: Option<String>,
     doctype_external_system_id: Option<String>,
     doctype_public_id: Option<String>,
@@ -138,7 +143,7 @@ pub struct Scanner<'a> {
 
     general_entities: HashMap<String, String>,
     external_entity_names: HashMap<String, ExtEntity>,
-    parameter_entities: HashMap<String, String>,
+    parameter_entities: HashMap<String, Rc<[char]>>,
     parameter_entity_external_ids: HashMap<String, ExtPe>,
 
     parameter_entity_expansion_stack: Vec<String>,
@@ -421,6 +426,8 @@ impl<'a> Scanner<'a> {
             doctype_subset_closed: false,
             doctype_name_pending: None,
             doctype_pending: None,
+            in_skipped_declaration: false,
+            skip_decl_quote: None,
             doctype_external_public_id: None,
             doctype_external_system_id: None,
             doctype_public_id: None,
@@ -524,6 +531,8 @@ impl<'a> Scanner<'a> {
         self.doctype_subset_closed = false;
         self.doctype_name_pending = None;
         self.doctype_pending = None;
+        self.in_skipped_declaration = false;
+        self.skip_decl_quote = None;
         self.doctype_external_public_id = None;
         self.doctype_external_system_id = None;
         self.doctype_public_id = None;
@@ -2188,7 +2197,7 @@ impl<'a> Scanner<'a> {
                 match self.resolve_parameter_entity_reference_at(q, pending)? {
                     None => return Ok(None),
                     Some(replacement) => {
-                        for rc in &replacement {
+                        for rc in replacement.iter() {
                             sb.push(*rc);
                         }
                         q = self.last_pe_reference_end;
@@ -2326,7 +2335,8 @@ impl<'a> Scanner<'a> {
                     && !self.parameter_entities.contains_key(&name)
                     && !self.parameter_entity_external_ids.contains_key(&name)
                 {
-                    pending.param_entities.insert(name.clone(), sb.clone());
+                    let decoded: Rc<[char]> = sb.chars().collect::<Vec<char>>().into();
+                    pending.param_entities.insert(name.clone(), decoded);
                     self.handler.internal_entity_decl(&format!("%{name}"), &sb)?;
                 }
             } else if !pending.entities.contains_key(&name)
@@ -3097,7 +3107,7 @@ impl<'a> Scanner<'a> {
         if self.doctype_seen {
             return Err(self.fatal("Only one DOCTYPE declaration is allowed"));
         }
-        if self.settings.disallow_doctype_decl {
+        if matches!(self.settings.doctype_handling, DoctypeHandling::Disallow) {
             return Err(self.fatal(
                 "DOCTYPE is disallowed when the feature \"http://apache.org/xml/features/disallow-doctype-decl\" is set to true",
             ));
@@ -3158,10 +3168,15 @@ impl<'a> Scanner<'a> {
             let sys_id = self.doctype_external_system_id.clone();
             self.handler.start_dtd(&name, pub_id.as_deref(), sys_id.as_deref())?;
             self.doctype_name_pending = Some(name);
-            self.doctype_pending = Some(PendingDecls::default());
             self.pos = p + 1;
             self.in_doctype = true;
-            if !self.scan_doctype_subset()? {
+            let finished = if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
+                self.skip_doctype_subset_inner()?
+            } else {
+                self.doctype_pending = Some(PendingDecls::default());
+                self.scan_doctype_subset()?
+            };
+            if !finished {
                 return Ok(false);
             }
             self.in_doctype = false;
@@ -3184,6 +3199,14 @@ impl<'a> Scanner<'a> {
     }
 
     fn finish_doctype_external_subset(&mut self, root_name: &str) -> ParseResult<()> {
+        if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
+            // Never fetch or parse an external subset in Skip mode,
+            // regardless of external_parameter_entities — that flag only
+            // controls whether Process mode reads external content.
+            self.doctype_external_public_id = None;
+            self.doctype_external_system_id = None;
+            return Ok(());
+        }
         if self.doctype_external_system_id.is_some() {
             self.handler.start_entity("[dtd]")?;
             if self.settings.external_parameter_entities {
@@ -3366,6 +3389,148 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// `DoctypeHandling::Skip`'s counterpart to `scan_doctype_subset_inner`:
+    /// recognizes the internal subset well enough to find where it ends
+    /// (bracket/quote/comment/PI-aware) without parsing any declaration's
+    /// contents — no entity table, no attribute defaults are built. Reuses
+    /// the same comment/PI sub-scanners as the full parse, since those are
+    /// generic and don't care why the caller is scanning.
+    fn skip_doctype_subset_inner(&mut self) -> ParseResult<bool> {
+        if !self.doctype_subset_closed {
+            loop {
+                if self.in_pi {
+                    if !self.scan_pi_data()? {
+                        return Ok(false);
+                    }
+                    self.in_pi = false;
+                    continue;
+                }
+                if self.in_comment {
+                    if !self.scan_comment_data()? {
+                        return Ok(false);
+                    }
+                    self.in_comment = false;
+                    continue;
+                }
+                if self.in_skipped_declaration {
+                    if !self.skip_declaration_body()? {
+                        return Ok(false);
+                    }
+                    self.in_skipped_declaration = false;
+                    continue;
+                }
+                self.pos = self.skip_optional_whitespace(self.pos);
+                if self.pos >= self.limit {
+                    return Ok(false);
+                }
+                let c = self.buf[self.pos];
+                if c == ']' {
+                    self.pos += 1;
+                    self.doctype_subset_closed = true;
+                    break;
+                }
+                if c == '%' {
+                    // A parameter entity reference used as a declaration
+                    // separator — skip the token itself, don't resolve it.
+                    let mut q = self.pos + 1;
+                    while q < self.limit && is_name_char(self.buf[q]) {
+                        q += 1;
+                    }
+                    if q >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf[q] != ';' {
+                        return Err(self.fatal("Malformed parameter entity reference"));
+                    }
+                    self.pos = q + 1;
+                    continue;
+                }
+                if c != '<' {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+                if self.pos + 1 >= self.limit {
+                    return Ok(false);
+                }
+                let c2 = self.buf[self.pos + 1];
+                if c2 == '?' {
+                    if !self.scan_pi(self.pos)? {
+                        return Ok(false);
+                    }
+                } else if c2 == '!' {
+                    if self.pos + 2 >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf[self.pos + 2] == '-' {
+                        if !self.scan_comment(self.pos)? {
+                            return Ok(false);
+                        }
+                    } else {
+                        // <!ELEMENT / <!ATTLIST / <!ENTITY / <!NOTATION —
+                        // skip to the first unquoted '>'. Uniform across
+                        // all four (not distinguishing which one matched)
+                        // is strictly safe and simpler.
+                        self.pos += 2;
+                        self.in_skipped_declaration = true;
+                        self.skip_decl_quote = None;
+                    }
+                } else {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+            }
+        }
+
+        self.pos = self.skip_optional_whitespace(self.pos);
+        if self.pos >= self.limit {
+            return Ok(false);
+        }
+        if self.buf[self.pos] != '>' {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        self.pos += 1;
+
+        let name_pending = self.doctype_name_pending.clone().unwrap_or_default();
+        self.finish_doctype_external_subset(&name_pending)?;
+        self.handler.end_dtd()?;
+        self.doctype_seen = true;
+        self.doctype_name = self.doctype_name_pending.take();
+        self.doctype_name_pending = None;
+        self.doctype_subset_closed = false;
+        Ok(true)
+    }
+
+    /// Advances past a skipped `<!...>` declaration's body to its first
+    /// unquoted `>`, tracking `self.skip_decl_quote` so a `>` or `]` inside
+    /// a quoted default/literal value doesn't end the declaration early.
+    /// Resumable across `receive()` calls, same idiom as `in_pi`/`in_comment`.
+    fn skip_declaration_body(&mut self) -> ParseResult<bool> {
+        loop {
+            if self.pos >= self.limit {
+                return Ok(false);
+            }
+            let c = self.buf[self.pos];
+            if let Some(q) = self.skip_decl_quote {
+                self.pos += 1;
+                if c == q {
+                    self.skip_decl_quote = None;
+                }
+                continue;
+            }
+            match c {
+                '\'' | '"' => {
+                    self.skip_decl_quote = Some(c);
+                    self.pos += 1;
+                }
+                '>' => {
+                    self.pos += 1;
+                    return Ok(true);
+                }
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
     fn resolve_attlist_defaults_against_entities(&mut self) -> ParseResult<()> {
         let raws = self.dtd_model.collect_default_raws();
         for (element, attr, raw) in raws {
@@ -3379,6 +3544,14 @@ impl<'a> Scanner<'a> {
         let is_general = self.general_entities.contains_key(name);
         let is_external = self.external_entity_names.contains_key(name);
         if !is_general && !is_external {
+            if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
+                // The DTD's contents were never read, so we genuinely can't
+                // tell whether this entity is declared — report it via the
+                // standard "unresolvable, don't expand, don't error" path
+                // rather than treating it as a well-formedness violation.
+                self.handler.skipped_entity(name)?;
+                return Ok(false);
+            }
             if self.saw_internal_subset_parameter_entity_reference {
                 let msg = format!(
                     "Validity Constraint: Entity Declared (Section 4.1). Entity \"{name}\" was not declared (a parameter entity reference elsewhere in the internal DTD subset downgrades this from a well-formedness error to a validity error)."
@@ -3984,7 +4157,10 @@ impl<'a> Scanner<'a> {
         self.check_entity_expansion_limit(replacement_chars.len() as i64)?;
         self.parameter_entity_expansion_stack.push(name.clone());
 
-        let saved_buf = std::mem::replace(&mut self.buf, replacement_chars);
+        // self.buf must be a uniquely-owned Vec<char> (the recursive parse
+        // below writes into it, including further splices) — this copy is
+        // a plain slice memcpy from the shared Rc, not a UTF-8 re-decode.
+        let saved_buf = std::mem::replace(&mut self.buf, replacement_chars.to_vec());
         let saved_pos = self.pos;
         let saved_limit = self.limit;
         let saved_parsing = self.parsing_external_content;
@@ -4020,7 +4196,11 @@ impl<'a> Scanner<'a> {
         &mut self,
         name: &str,
         pending: &PendingDecls,
-    ) -> ParseResult<Option<Vec<char>>> {
+    ) -> ParseResult<Option<Rc<[char]>>> {
+        // `.cloned()` here clones an `Rc` (refcount bump), not the
+        // underlying text — repeat references to the same entity (the
+        // common case; that's what parameter entities are for) no longer
+        // pay to re-decode UTF-8 into a fresh `Vec<char>` every time.
         let literal = pending
             .param_entities
             .get(name)
@@ -4028,7 +4208,7 @@ impl<'a> Scanner<'a> {
             .or_else(|| self.parameter_entities.get(name).cloned());
         if let Some(literal) = literal {
             self.last_param_entity_was_external = false;
-            return Ok(Some(literal.chars().collect()));
+            return Ok(Some(literal));
         }
         let external = pending
             .param_external_names
@@ -4044,7 +4224,7 @@ impl<'a> Scanner<'a> {
         };
         if !self.settings.external_parameter_entities {
             self.last_param_entity_was_external = true;
-            return Ok(Some(Vec::new()));
+            return Ok(Some(Rc::from([])));
         }
         self.last_param_entity_was_external = true;
         let saved_base = self.base_system_id.clone();
@@ -4060,14 +4240,21 @@ impl<'a> Scanner<'a> {
         );
         self.base_system_id = saved_base;
         let fetched = fetched?;
-        Ok(Some(self.strip_declaration(&fetched)?))
+        Ok(Some(self.strip_declaration(&fetched)?.into()))
     }
 
     // ===== PE splicing inside declarations =====
 
+    /// Splices `replacement` into `self.buf[start..end]`, padded with one
+    /// leading and one trailing space (per the XML spec's requirement that
+    /// a parameter-entity reference used as a declaration separator behave
+    /// like whitespace). Writes the padding directly rather than requiring
+    /// the caller to pre-build a padded copy — this is on the hot path for
+    /// DTDs that use parameter entities as declaration separators, so it's
+    /// worth not allocating a throwaway `Vec<char>` per reference.
     fn splice_into_buf(&mut self, start: usize, end: usize, replacement: &[char]) -> usize {
         let old_span = end - start;
-        let new_span = replacement.len();
+        let new_span = replacement.len() + 2;
         let delta = new_span as i64 - old_span as i64;
         if delta > 0 {
             let needed = (self.limit as i64 + delta) as usize;
@@ -4093,9 +4280,11 @@ impl<'a> Scanner<'a> {
                 }
             }
         }
+        self.buf[start] = ' ';
         for (i, c) in replacement.iter().enumerate() {
-            self.buf[start + i] = *c;
+            self.buf[start + 1 + i] = *c;
         }
+        self.buf[start + 1 + replacement.len()] = ' ';
         self.limit = (self.limit as i64 + delta) as usize;
         self.last_splice_end = (start + new_span) as i64;
         self.saw_splice_since_declaration_start = true;
@@ -4115,12 +4304,8 @@ impl<'a> Scanner<'a> {
         if check_paren_balance {
             self.check_pe_replacement_paren_balance(&replacement_chars)?;
         }
-        let mut replacement: Vec<char> = Vec::with_capacity(replacement_chars.len() + 2);
-        replacement.push(' ');
-        replacement.extend_from_slice(&replacement_chars);
-        replacement.push(' ');
         let end = self.last_pe_reference_end;
-        Ok(self.splice_into_buf(p, end, &replacement))
+        Ok(self.splice_into_buf(p, end, &replacement_chars))
     }
 
     fn check_pe_replacement_paren_balance(&mut self, replacement_chars: &[char]) -> ParseResult<()> {
@@ -4157,7 +4342,7 @@ impl<'a> Scanner<'a> {
         &mut self,
         p: usize,
         pending: &mut PendingDecls,
-    ) -> ParseResult<Option<Vec<char>>> {
+    ) -> ParseResult<Option<Rc<[char]>>> {
         let name_start = p + 1;
         let mut q = name_start;
         while q < self.limit && is_name_char(self.buf[q]) {

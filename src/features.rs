@@ -43,6 +43,35 @@ pub enum PropertyValue {
     Integer(i32),
 }
 
+/// How a `<!DOCTYPE ...>` declaration is handled.
+///
+/// The standard SAX/Xerces `disallow-doctype-decl` boolean feature only
+/// distinguishes [`Disallow`](DoctypeHandling::Disallow) from
+/// [`Process`](DoctypeHandling::Process) — [`Skip`](DoctypeHandling::Skip)
+/// has no standard-feature equivalent and is only reachable by setting
+/// [`FeatureSet::doctype_handling`] directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DoctypeHandling {
+    /// Reject any document containing a `<!DOCTYPE` outright (a security
+    /// hardening option — matches Xerces' `disallow-doctype-decl=true`).
+    Disallow,
+    /// Recognize the `<!DOCTYPE` construct just well enough to skip past it
+    /// (bracket/quote/comment/PI-aware), without parsing its declarations:
+    /// no entity table, no attribute defaults, no validation. An entity
+    /// reference the DTD would otherwise have declared is reported via
+    /// [`crate::XmlHandler::skipped_entity`] instead of being expanded or
+    /// erroring. This is a deliberate, explicit reduction in
+    /// well-formedness checking for the DTD's *contents* specifically (the
+    /// rest of the document is checked as always) — matching what parsers
+    /// that don't support DTDs at all (e.g. quick-xml) already do.
+    Skip,
+    /// Parse and use the DTD's declarations (entities, attribute defaults);
+    /// validate them too if [`FeatureSet::validation`] is on. Today's
+    /// default behavior, unchanged.
+    #[default]
+    Process,
+}
+
 /// Mutable feature/property store matching Gonzalez `Parser` defaults.
 #[derive(Debug, Clone)]
 pub struct FeatureSet {
@@ -51,7 +80,7 @@ pub struct FeatureSet {
     pub validation: bool,
     pub external_general_entities: bool,
     pub external_parameter_entities: bool,
-    pub disallow_doctype_decl: bool,
+    pub doctype_handling: DoctypeHandling,
     pub resolve_dtd_uris: bool,
     pub string_interning: bool,
     pub xmlns_uris: bool,
@@ -69,7 +98,7 @@ impl Default for FeatureSet {
             validation: false,
             external_general_entities: false,
             external_parameter_entities: false,
-            disallow_doctype_decl: false,
+            doctype_handling: DoctypeHandling::Process,
             resolve_dtd_uris: true,
             string_interning: true,
             xmlns_uris: false,
@@ -89,7 +118,7 @@ impl FeatureSet {
             FEATURE_VALIDATION => Ok(self.validation),
             FEATURE_EXTERNAL_GENERAL_ENTITIES => Ok(self.external_general_entities),
             FEATURE_EXTERNAL_PARAMETER_ENTITIES => Ok(self.external_parameter_entities),
-            FEATURE_DISALLOW_DOCTYPE_DECL => Ok(self.disallow_doctype_decl),
+            FEATURE_DISALLOW_DOCTYPE_DECL => Ok(self.doctype_handling == DoctypeHandling::Disallow),
             FEATURE_RESOLVE_DTD_URIS => Ok(self.resolve_dtd_uris),
             FEATURE_STRING_INTERNING => Ok(self.string_interning),
             FEATURE_XMLNS_URIS => Ok(self.xmlns_uris),
@@ -122,7 +151,13 @@ impl FeatureSet {
             FEATURE_VALIDATION => self.validation = value,
             FEATURE_EXTERNAL_GENERAL_ENTITIES => self.external_general_entities = value,
             FEATURE_EXTERNAL_PARAMETER_ENTITIES => self.external_parameter_entities = value,
-            FEATURE_DISALLOW_DOCTYPE_DECL => self.disallow_doctype_decl = value,
+            FEATURE_DISALLOW_DOCTYPE_DECL => {
+                self.doctype_handling = if value {
+                    DoctypeHandling::Disallow
+                } else {
+                    DoctypeHandling::Process
+                }
+            }
             FEATURE_RESOLVE_DTD_URIS => self.resolve_dtd_uris = value,
             FEATURE_STRING_INTERNING => self.string_interning = value,
             FEATURE_XMLNS_URIS => self.xmlns_uris = value,
@@ -191,7 +226,7 @@ impl FeatureSet {
         ScannerSettings {
             external_general_entities: self.external_general_entities,
             external_parameter_entities: self.external_parameter_entities,
-            disallow_doctype_decl: self.disallow_doctype_decl,
+            doctype_handling: self.doctype_handling,
             resolve_dtd_uris: self.resolve_dtd_uris,
             access_external_dtd: self.access_external_dtd.clone(),
             entity_expansion_limit: self.entity_expansion_limit,
@@ -204,7 +239,7 @@ impl FeatureSet {
 pub struct ScannerSettings {
     pub external_general_entities: bool,
     pub external_parameter_entities: bool,
-    pub disallow_doctype_decl: bool,
+    pub doctype_handling: DoctypeHandling,
     pub resolve_dtd_uris: bool,
     pub access_external_dtd: String,
     pub entity_expansion_limit: i32,
@@ -216,7 +251,7 @@ impl ScannerSettings {
         Self {
             external_general_entities: true,
             external_parameter_entities: true,
-            disallow_doctype_decl: false,
+            doctype_handling: DoctypeHandling::Process,
             resolve_dtd_uris: true,
             access_external_dtd: "all".to_string(),
             entity_expansion_limit: i32::MAX,

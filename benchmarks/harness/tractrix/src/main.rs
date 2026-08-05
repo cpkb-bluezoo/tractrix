@@ -1,9 +1,11 @@
 //! Throughput benchmark for tractrix itself, driven the same way the
 //! README's push example shows: `Parser::receive(Bytes)` in a loop.
 //!
-//! Two configs, matching the feature-parity matrix (see benchmarks/README.md):
-//!   - "ns":     namespaces on, validation off  — compared against Expat & quick-xml
-//!   - "ns+dtd": namespaces on, validation on   — compared against libxml2
+//! Three configs, matching the feature-parity matrix (see benchmarks/README.md):
+//!   - "ns":     namespaces on, validation off, DOCTYPE processed — compared against Expat
+//!   - "ns+dtd": namespaces on, validation on, DOCTYPE processed   — compared against libxml2
+//!   - "skip":   namespaces on, DOCTYPE contents skipped entirely  — compared against quick-xml,
+//!               which never processes a DTD's contents at all (see `DoctypeHandling::Skip`)
 //!
 //! For "ns+dtd", external DTD/entity resolution is enabled (mirroring
 //! `tests/conformance/xmlconf.rs`'s valid/invalid handling) with the
@@ -14,7 +16,7 @@
 //! scripts/assemble_corpus.sh: run it over a candidate file list with
 //! iterations=1 and read which files show up in the "errors" array.
 //!
-//! Usage: bench_tractrix <file-list> <chunk-size-bytes> <iterations> <ns|ns+dtd>
+//! Usage: bench_tractrix <file-list> <chunk-size-bytes> <iterations> <ns|ns+dtd|skip>
 
 use std::env;
 use std::fs;
@@ -22,7 +24,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use bytes::Bytes;
-use tractrix::{DefaultHandler, EntityResolver, FeatureSet, FileEntityResolver, NamespaceFilter, Parser};
+use tractrix::{
+    DefaultHandler, DoctypeHandling, EntityResolver, FeatureSet, FileEntityResolver,
+    NamespaceFilter, Parser,
+};
 
 struct Doc {
     path: String,
@@ -138,7 +143,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() != 5 {
         eprintln!(
-            "usage: {} <file-list> <chunk-size-bytes> <iterations> <ns|ns+dtd>",
+            "usage: {} <file-list> <chunk-size-bytes> <iterations> <ns|ns+dtd|skip>",
             args[0]
         );
         return ExitCode::from(2);
@@ -151,16 +156,18 @@ fn main() -> ExitCode {
         eprintln!("chunk-size and iterations must be positive");
         return ExitCode::from(2);
     }
-    let (validation, use_dtd_resolver) = match config {
-        "ns" => (false, false),
-        "ns+dtd" => (true, true),
+    let (validation, use_dtd_resolver, doctype_handling) = match config {
+        "ns" => (false, false, DoctypeHandling::Process),
+        "ns+dtd" => (true, true, DoctypeHandling::Process),
+        "skip" => (false, false, DoctypeHandling::Skip),
         _ => {
-            eprintln!("config must be 'ns' or 'ns+dtd', got '{config}'");
+            eprintln!("config must be 'ns', 'ns+dtd', or 'skip', got '{config}'");
             return ExitCode::from(2);
         }
     };
 
     let mut features = FeatureSet::default(); // namespaces: true, validation: false
+    features.doctype_handling = doctype_handling;
     if validation {
         features.validation = true;
         features.external_general_entities = true;

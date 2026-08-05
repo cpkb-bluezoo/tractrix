@@ -39,15 +39,33 @@ holds the chunk size and iteration count. Bump either and re-run.
 
 ## Feature-parity matrix
 
-All three target parsers support namespace-aware parsing, so namespaces are
-on in every comparison. Only DTD validation differs, since only libxml2
-actually validates:
+Namespaces are on in every comparison — all three target parsers support
+namespace-aware parsing. DTD handling is where the real differences are, and
+it turns out there are three genuinely different amounts of work a parser
+can do with a `<!DOCTYPE ...>`, not two:
 
-| vs. | tractrix config | why |
-|---|---|---|
-| Expat | `namespaces: true`, `validation: false` | Expat parses the DTD structurally (default entities) but has no validating mode |
-| quick-xml | `namespaces: true`, `validation: false` | quick-xml does not validate against a DTD |
-| libxml2 | `namespaces: true`, `validation: true` | libxml2's SAX2 interface does full DTD validation |
+1. **Ignore it entirely** — recognize the construct just well enough to skip
+   past it, but never parse a single declaration: no entity table, no
+   attribute defaults. quick-xml's own source says this outright ("this
+   crate does not support parsing DTDs").
+2. **Parse and use it, but don't validate** — build the entity table, apply
+   attribute defaults, but never check a validity constraint as an error.
+   Expat works this way unconditionally (it has no validation mode at all).
+3. **Parse, use, and validate** — libxml2 with `XML_PARSE_DTDVALID`.
+
+The first version of this benchmark compared tractrix's non-validating
+config (tier 2) against quick-xml (tier 1) under the same "ns" label — not a
+fair fight, since quick-xml is doing categorically less work. tractrix has a
+`DoctypeHandling` feature with three matching settings — `Disallow` (reject
+any DOCTYPE outright, unrelated to this), `Skip` (tier 1), and `Process`
+(tiers 2/3, `validation` on or off) — so now each comparison actually
+matches capability tiers:
+
+| vs. | tractrix config | tier | why |
+|---|---|---|---|
+| quick-xml | `doctype_handling: Skip` | 1 | quick-xml never processes DTD contents at all |
+| Expat | `doctype_handling: Process`, `validation: false` | 2 | Expat parses the DTD (entities, attribute defaults) but has no validating mode |
+| libxml2 | `doctype_handling: Process`, `validation: true` | 3 | libxml2's SAX2 interface does full DTD validation |
 
 ## The libxml2 exception to "no-op sink"
 
@@ -73,8 +91,8 @@ anyway.
 Two tiers, both assembled by `scripts/assemble_corpus.sh` and pooled across
 projects (not isolated per-parser):
 
-- **Tier 1 (well-formed)** — used for Expat, quick-xml, and tractrix's `ns`
-  config.
+- **Tier 1 (well-formed)** — used for Expat + tractrix's `ns` config, and
+  quick-xml + tractrix's `skip` config.
 - **Tier 2 (DTD-validating)** — a subset of Tier 1: must contain a
   `<!DOCTYPE`, and pass tractrix's own validating oracle. Used for libxml2
   and tractrix's `ns+dtd` config. (libxml2's `XML_PARSE_DTDVALID` errors
@@ -196,3 +214,10 @@ treating as bugs:
   specific fixtures, is an open question this benchmark surfaced rather
   than answered — worth a closer look separately, not something this
   harness should paper over.
+- **tractrix's `skip` config** rejects one Tier 1 document,
+  `libxml2/test/valid/ns.xml`, with "Element prefix is not bound to a
+  namespace URI". That file supplies its `xmlns:a`/`xmlns:b` bindings via
+  `#FIXED` ATTLIST defaults rather than explicit attributes — exactly the
+  DTD-dependent behavior `Skip` mode deliberately forgoes (no attribute
+  defaults are applied). Expected, not a bug — it's the direct, documented
+  consequence of `DoctypeHandling::Skip`, see `docs/security.html`.

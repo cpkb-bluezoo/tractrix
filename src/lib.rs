@@ -51,7 +51,7 @@ pub use entity::{
     EntityResolver, ExternalId, FileEntityResolver, RefusingEntityResolver, ResolvedEntity,
 };
 pub use error::{FeatureError, ParseError, ParseResult};
-pub use features::{FeatureSet, PropertyValue, ScannerSettings};
+pub use features::{DoctypeHandling, FeatureSet, PropertyValue, ScannerSettings};
 pub use handler::{DefaultHandler, XmlHandler};
 pub use indent::IndentConfig;
 pub use locator::{DocumentLocator, Locator};

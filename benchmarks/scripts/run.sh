@@ -64,6 +64,7 @@ log "=== throughput matrix (chunk=${CHUNK_SIZE_BYTES} bytes, iterations=${ITERAT
 run_one expat.json           "$EXPAT_BIN"    "$CORPUS_DIR/filelist_wf.txt"    "$CHUNK_SIZE_BYTES" "$ITERATIONS"
 run_one quick-xml.json       "$QUICKXML_BIN" "$CORPUS_DIR/filelist_wf.txt"    "$CHUNK_SIZE_BYTES" "$ITERATIONS"
 run_one tractrix-ns.json     "$TRACTRIX_BIN" "$CORPUS_DIR/filelist_wf.txt"    "$CHUNK_SIZE_BYTES" "$ITERATIONS" ns
+run_one tractrix-skip.json   "$TRACTRIX_BIN" "$CORPUS_DIR/filelist_wf.txt"    "$CHUNK_SIZE_BYTES" "$ITERATIONS" skip
 run_one libxml2.json         "$LIBXML2_BIN"  "$CORPUS_DIR/filelist_valid.txt" "$CHUNK_SIZE_BYTES" "$ITERATIONS"
 run_one tractrix-ns+dtd.json "$TRACTRIX_BIN" "$CORPUS_DIR/filelist_valid.txt" "$CHUNK_SIZE_BYTES" "$ITERATIONS" ns+dtd
 

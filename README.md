@@ -158,6 +158,15 @@ assert_eq!(handler.title, "Hello & world");
 | `accessExternalDTD` | `""` | Protocol allow-list for external DTD ("file", "all", etc.) |
 | `entity-expansion-limit` | 64000 | Maximum entity expansions per document |
 
+`disallow-doctype-decl` is the standard SAX/Xerces boolean feature, but it's
+backed by a 3-way `doctype_handling: DoctypeHandling` field
+(`Disallow` / `Skip` / `Process`, default `Process`) rather than a plain
+bool. The boolean feature only ever sets `Disallow` or `Process` — the third
+option, `Skip` (recognize and skip past a DOCTYPE's contents without
+parsing them: no entity table, no attribute defaults, matching what parsers
+without DTD support do), has no standard-feature equivalent and is set
+directly: `features.doctype_handling = DoctypeHandling::Skip;`.
+
 Features are configured via `FeatureSet` before creating the parser:
 
 ```rust

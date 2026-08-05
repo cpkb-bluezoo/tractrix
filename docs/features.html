@@ -62,13 +62,22 @@
           <tr><td><code>validation</code></td><td>off</td><td>DTD validation (models, attribute types, ID/IDREF, …)</td></tr>
           <tr><td><code>external_general_entities</code></td><td><strong>off</strong></td><td>Load external general entities</td></tr>
           <tr><td><code>external_parameter_entities</code></td><td><strong>off</strong></td><td>Load external parameter entities</td></tr>
-          <tr><td><code>disallow_doctype_decl</code></td><td>off</td><td>Reject any DOCTYPE</td></tr>
+          <tr><td><code>doctype_handling</code></td><td><code>Process</code></td><td>How a <code>&lt;!DOCTYPE&gt;</code> is handled: <code>Disallow</code> (reject outright), <code>Skip</code> (skip past its contents, no entity/attribute processing), or <code>Process</code> (full parsing, today's default)</td></tr>
           <tr><td><code>access_external_dtd</code></td><td><code>""</code></td><td>Protocol allow-list (<code>"file"</code>, <code>"all"</code>, …)</td></tr>
           <tr><td><code>entity_expansion_limit</code></td><td>64000</td><td>Max expansions per document</td></tr>
           <tr><td><code>resolve_dtd_uris</code></td><td>on</td><td>Resolve relative system IDs</td></tr>
           <tr><td><code>string_interning</code></td><td>on</td><td>Intern element/attribute names</td></tr>
         </tbody>
       </table>
+
+      <p>
+        The standard SAX/Xerces boolean feature
+        <code>disallow-doctype-decl</code> is backed by
+        <code>doctype_handling</code>: setting it maps onto
+        <code>Disallow</code>/<code>Process</code> only.
+        <code>Skip</code> has no standard-feature equivalent and is set
+        directly on the field.
+      </p>
 
       <h2 id="example">Example</h2>
       <pre><code>use tractrix::FeatureSet;

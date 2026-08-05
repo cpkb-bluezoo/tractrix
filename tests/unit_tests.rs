@@ -2,10 +2,14 @@
 
 //! Unit tests for Tractrix push-model XML parser.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use bytes::Bytes;
 use tractrix::{
-    EntityResolver, FeatureSet, IndentConfig, NamespaceFilter, OutputCharset, ParseError,
-    ParseResult, Parser, RefusingEntityResolver, XmlHandler, XmlWriter,
+    DoctypeHandling, EntityResolver, FeatureSet, IndentConfig, NamespaceFilter, OutputCharset,
+    ParseError, ParseResult, Parser, RefusingEntityResolver, ResolvedEntity, XmlHandler,
+    XmlWriter,
 };
 
 // ===== Helpers =====
@@ -1320,4 +1324,162 @@ fn indent_config_factories() {
     assert_eq!(IndentConfig::spaces(3).indent_count(), 3);
     assert!(IndentConfig::new('x', 1).is_err());
     assert!(IndentConfig::new(' ', 0).is_err());
+}
+
+// ===== DoctypeHandling::Skip tests =====
+
+struct FlaggingResolver {
+    called: Rc<Cell<bool>>,
+}
+
+impl EntityResolver for FlaggingResolver {
+    fn resolve(
+        &mut self,
+        _public_id: Option<&str>,
+        _system_id: &str,
+        _base_uri: Option<&str>,
+    ) -> ParseResult<Option<ResolvedEntity>> {
+        self.called.set(true);
+        Ok(None)
+    }
+}
+
+fn parse_with_skip(xml: &str) -> RecordingHandler {
+    let mut handler = RecordingHandler::new();
+    let mut features = FeatureSet::default();
+    features.doctype_handling = DoctypeHandling::Skip;
+    let mut filter = NamespaceFilter::new(&mut handler, false);
+    let mut parser = Parser::new(&mut filter, &features, None, None, None).unwrap();
+    parser.parse_all(Bytes::from(xml.to_string())).unwrap();
+    drop(parser);
+    drop(filter);
+    handler
+}
+
+#[test]
+fn doctype_skip_ignores_subset_contents_but_parses_body() {
+    let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE r [
+  <!-- a comment in the subset -->
+  <?a-pi some data?>
+  <!ENTITY greeting "hello">
+  <!ATTLIST r id CDATA "has > and ] inside">
+  <!ELEMENT r (#PCDATA)>
+]>
+<r id="x">body text</r>"#;
+
+    let handler = parse_with_skip(xml);
+    assert!(!handler.got_fatal, "fatal: {:?}", handler.fatal_message);
+    assert!(handler.events.iter().any(|e| e.starts_with("start_dtd:r")));
+    assert!(handler.events.contains(&"end_dtd".to_string()));
+    assert!(handler.events.iter().any(|e| e == "start_element:r"));
+    assert!(handler
+        .events
+        .iter()
+        .any(|e| e.starts_with("characters:body text")));
+    // Nothing was actually declared: the subset was skipped, not parsed.
+    assert!(!handler
+        .events
+        .iter()
+        .any(|e| e.starts_with("internal_entity_decl")));
+}
+
+#[test]
+fn doctype_skip_reports_skipped_entity_in_content() {
+    let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE r [
+  <!ENTITY greeting "hello">
+]>
+<r>&greeting;</r>"#;
+
+    let handler = parse_with_skip(xml);
+    assert!(!handler.got_fatal, "fatal: {:?}", handler.fatal_message);
+    assert!(handler
+        .events
+        .contains(&"skipped_entity:greeting".to_string()));
+}
+
+#[test]
+fn doctype_skip_reports_skipped_entity_in_attribute_value() {
+    let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE r [
+  <!ENTITY greeting "hello">
+]>
+<r a="&greeting;"/>"#;
+
+    let handler = parse_with_skip(xml);
+    assert!(!handler.got_fatal, "fatal: {:?}", handler.fatal_message);
+    assert!(handler
+        .events
+        .contains(&"skipped_entity:greeting".to_string()));
+}
+
+#[test]
+fn doctype_skip_never_fetches_external_subset() {
+    let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE r SYSTEM "should-not-be-fetched.dtd">
+<r/>"#;
+
+    let called = Rc::new(Cell::new(false));
+    let resolver = Box::new(FlaggingResolver {
+        called: called.clone(),
+    });
+
+    let mut handler = RecordingHandler::new();
+    let mut features = FeatureSet::default();
+    features.doctype_handling = DoctypeHandling::Skip;
+    // Even with external fetching allowed, Skip must never use it.
+    features.external_parameter_entities = true;
+    let mut filter = NamespaceFilter::new(&mut handler, false);
+    let mut parser = Parser::new(&mut filter, &features, Some(resolver), None, None).unwrap();
+    parser.parse_all(Bytes::from(xml.to_string())).unwrap();
+    drop(parser);
+    drop(filter);
+
+    assert!(!handler.got_fatal, "fatal: {:?}", handler.fatal_message);
+    assert!(!called.get(), "Skip mode must never fetch an external subset");
+}
+
+#[test]
+fn doctype_disallow_still_rejects_any_doctype() {
+    let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE r [<!ELEMENT r (#PCDATA)>]>
+<r/>"#;
+
+    let mut handler = RecordingHandler::new();
+    let mut features = FeatureSet::default();
+    features.doctype_handling = DoctypeHandling::Disallow;
+    let mut filter = NamespaceFilter::new(&mut handler, false);
+    let mut parser = Parser::new(&mut filter, &features, None, None, None).unwrap();
+    let result = parser.parse_all(Bytes::from(xml.to_string()));
+    drop(parser);
+    drop(filter);
+
+    assert!(result.is_err());
+    assert!(handler.got_fatal);
+}
+
+#[test]
+fn feature_disallow_doctype_decl_roundtrip() {
+    let mut features = FeatureSet::default();
+    assert_eq!(features.doctype_handling, DoctypeHandling::Process);
+
+    features
+        .set_feature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        .unwrap();
+    assert_eq!(features.doctype_handling, DoctypeHandling::Disallow);
+    assert!(features
+        .get_feature("http://apache.org/xml/features/disallow-doctype-decl")
+        .unwrap());
+
+    features
+        .set_feature(
+            "http://apache.org/xml/features/disallow-doctype-decl",
+            false,
+        )
+        .unwrap();
+    assert_eq!(features.doctype_handling, DoctypeHandling::Process);
+    assert!(!features
+        .get_feature("http://apache.org/xml/features/disallow-doctype-decl")
+        .unwrap());
 }
