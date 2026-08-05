@@ -115,10 +115,10 @@ pub struct Scanner<'a> {
     content_run_is_whitespace: bool,
     content_bracket_run: i32,
 
-    element_stack: Vec<String>,
+    element_stack: Vec<Rc<str>>,
     validator_stack: Option<Vec<ContentModelValidator>>,
 
-    seen_attribute_names: Vec<String>,
+    seen_attribute_names: Vec<Rc<str>>,
 
     name_pool: PackedName,
 
@@ -822,7 +822,7 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    fn record_seen_attribute_name(&mut self, name: String) -> ParseResult<()> {
+    fn record_seen_attribute_name(&mut self, name: Rc<str>) -> ParseResult<()> {
         if self.was_attribute_seen(&name) {
             return Err(self.fatal(&format!(
                 "Well-formedness Constraint: Unique Att Spec. Attribute \"{name}\" already appeared on this element."
@@ -833,7 +833,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn was_attribute_seen(&self, name: &str) -> bool {
-        self.seen_attribute_names.iter().any(|n| n == name)
+        self.seen_attribute_names.iter().any(|n| n.as_ref() == name)
     }
 
     /// `weight` is normally 1 (one reference counted) except at the two call
@@ -1307,7 +1307,7 @@ impl<'a> Scanner<'a> {
             self.root_started = true;
             if self.validation_enabled {
                 if let Some(dname) = self.doctype_name.clone() {
-                    if dname != q_name {
+                    if dname != *q_name {
                         let msg = format!(
                             "Validity Constraint: Root Element Type (Section 3.2). Document root element \"{q_name}\" does not match DOCTYPE name \"{dname}\"."
                         );
@@ -1418,7 +1418,7 @@ impl<'a> Scanner<'a> {
 
             let attr_def = declared_attrs
                 .as_ref()
-                .and_then(|attrs| attrs.iter().find(|(n, _)| *n == attr_name).map(|(_, d)| d));
+                .and_then(|attrs| attrs.iter().find(|(n, _)| n.as_str() == attr_name.as_ref()).map(|(_, d)| d));
             let attr_type = attr_def.map(|d| d.attr_type.clone()).unwrap_or_else(|| "CDATA".to_string());
             if self.validation_enabled && attr_def.is_none() {
                 let msg = format!(
@@ -1433,14 +1433,14 @@ impl<'a> Scanner<'a> {
             self.pending_quote = quote;
             self.attr_value_run_open = false;
             self.collapse_current_attr_value = attr_type != "CDATA";
-            let check_xml_space = attr_name == "xml:space";
+            let check_xml_space = attr_name.as_ref() == "xml:space";
             self.normalizing_current_attribute =
                 self.collapse_current_attr_value || self.validation_enabled || check_xml_space;
             if self.normalizing_current_attribute {
                 self.normalize_builder.clear();
                 if self.validation_enabled || check_xml_space {
-                    self.current_attr_element_name = current_element_name.clone();
-                    self.current_attr_name = attr_name.clone();
+                    self.current_attr_element_name = current_element_name.to_string();
+                    self.current_attr_name = attr_name.to_string();
                     self.current_attr_type = attr_type.clone();
                 }
                 if self.validation_enabled

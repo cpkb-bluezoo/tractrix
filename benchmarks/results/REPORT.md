@@ -1,6 +1,6 @@
 # Benchmark results
 
-Generated: 2026-08-05T04:37:44Z
+Generated: 2026-08-05T04:59:40Z
 
 Versions: Expat 2.8.2 · libxml2 2.15.3 · quick-xml 0.39.0 · chunk size 32768 bytes · 10 iterations (first discarded as warm-up)
 
@@ -12,12 +12,12 @@ Corpus: 1212 well-formed files (Tier 1) / 482 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Files | Corpus (MB) | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| expat | ns | no-op sink | 1212 | 3.21 | 0.0353 | 91.1 | 6.8 | **2** (see below) |
-| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 482 | 0.60 | 0.0280 | 21.6 | 9.1 | **61** (see below) |
-| quick-xml | ns | no-op sink | 1212 | 3.21 | 0.0117 | 274.7 | 6.9 | **3** (see below) |
-| tractrix | ns+dtd | no-op sink (DefaultHandler) | 482 | 0.60 | 0.0754 | 8.0 | 9.6 | 0 |
-| tractrix | ns | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0827 | 38.8 | 8.7 | 0 |
-| tractrix | skip | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0653 | 49.2 | 9.1 | **1** (see below) |
+| expat | ns | no-op sink | 1212 | 3.21 | 0.0331 | 97.1 | 6.3 | **2** (see below) |
+| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 482 | 0.60 | 0.0262 | 23.1 | 9.0 | **61** (see below) |
+| quick-xml | ns | no-op sink | 1212 | 3.21 | 0.0113 | 283.0 | 6.8 | **3** (see below) |
+| tractrix | ns+dtd | no-op sink (DefaultHandler) | 482 | 0.60 | 0.0687 | 8.8 | 8.1 | 0 |
+| tractrix | ns | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0702 | 45.8 | 8.9 | 0 |
+| tractrix | skip | no-op sink (DefaultHandler) | 1212 | 3.21 | 0.0530 | 60.5 | 8.6 | **1** (see below) |
 
 
 ## Pathological case (single huge token)
@@ -26,14 +26,14 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 
 | Parser | Config | Document | Peak RSS (MB) | Time (s) |
 |---|---|---|---:|---:|
-| expat | ns | attribute | 259.8 | 0.5786 |
-| expat | ns | text/CDATA | 65.6 | 0.2556 |
-| libxml2 | ns+dtd | attribute | 260.0 | 0.3614 |
-| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3704 |
-| quick-xml | ns | attribute | 131.7 | 0.0640 |
-| quick-xml | ns | text/CDATA | 131.8 | 0.0136 |
-| tractrix | ns | attribute | 66.2 | 0.5593 |
-| tractrix | ns | text/CDATA | 66.2 | 0.4526 |
+| expat | ns | attribute | 259.8 | 0.5501 |
+| expat | ns | text/CDATA | 65.6 | 0.2433 |
+| libxml2 | ns+dtd | attribute | 259.0 | 0.3455 |
+| libxml2 | ns+dtd | text/CDATA | 260.7 | 0.3600 |
+| quick-xml | ns | attribute | 131.7 | 0.0614 |
+| quick-xml | ns | text/CDATA | 131.7 | 0.0153 |
+| tractrix | ns | attribute | 66.3 | 0.5441 |
+| tractrix | ns | text/CDATA | 66.3 | 0.4408 |
 
 ## Errors
 

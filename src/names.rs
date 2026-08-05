@@ -15,12 +15,17 @@
 //! contract (interning short name-like strings from a character window) is.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 /// Zero-allocation-on-hit interning pool for short, name-like strings
 /// (element/attribute names, PI targets). Mirrors Gonzalez `PackedName`.
+///
+/// Stores `Rc<str>` rather than `String` so a cache hit is a refcount bump,
+/// not a full string copy — element/attribute names repeat constantly in
+/// real documents, so hits are the common case this is optimizing for.
 #[derive(Debug, Default)]
 pub struct PackedName {
-    pool: HashSet<String>,
+    pool: HashSet<Rc<str>>,
 }
 
 impl PackedName {
@@ -31,19 +36,19 @@ impl PackedName {
     }
 
     /// Interns a name from a character-array range, returning a canonical
-    /// `String`. Mirrors `PackedName.internRange`.
-    pub fn intern_range(&mut self, buf: &[char], start: usize, len: usize) -> String {
+    /// `Rc<str>`. Mirrors `PackedName.internRange`.
+    pub fn intern_range(&mut self, buf: &[char], start: usize, len: usize) -> Rc<str> {
         let s: String = buf[start..start + len].iter().collect();
         self.intern_str(&s)
     }
 
-    /// Interns a `&str`, returning a canonical `String`.
-    pub fn intern_str(&mut self, s: &str) -> String {
+    /// Interns a `&str`, returning a canonical `Rc<str>`.
+    pub fn intern_str(&mut self, s: &str) -> Rc<str> {
         if let Some(existing) = self.pool.get(s) {
-            return existing.clone();
+            return Rc::clone(existing);
         }
-        let owned = s.to_string();
-        self.pool.insert(owned.clone());
+        let owned: Rc<str> = Rc::from(s);
+        self.pool.insert(Rc::clone(&owned));
         owned
     }
 }
