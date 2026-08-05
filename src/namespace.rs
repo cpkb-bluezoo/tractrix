@@ -332,14 +332,14 @@ impl<'a> NamespaceFilter<'a> {
 }
 
 fn is_ncname_start_char(c: char) -> bool {
-    if c == ':' {
-        return false;
+    // See is_name_start_char in scanner.rs for why ASCII gets its own
+    // branch: every range below is non-ASCII, so for ASCII input there's
+    // nothing left to check once this returns.
+    if c.is_ascii() {
+        return c != ':' && (c == '_' || c.is_ascii_alphabetic());
     }
     let u = c as u32;
-    c == '_'
-        || c.is_ascii_uppercase()
-        || c.is_ascii_lowercase()
-        || (0xC0..=0xD6).contains(&u)
+    (0xC0..=0xD6).contains(&u)
         || (0xD8..=0xF6).contains(&u)
         || (0xF8..=0x2FF).contains(&u)
         || (0x370..=0x37D).contains(&u)
@@ -354,16 +354,14 @@ fn is_ncname_start_char(c: char) -> bool {
 }
 
 fn is_ncname_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c != ':' && (c == '_' || c == '-' || c == '.' || c.is_ascii_alphanumeric());
+    }
     if is_ncname_start_char(c) {
         return true;
     }
     let u = c as u32;
-    c == '-'
-        || c == '.'
-        || c.is_ascii_digit()
-        || u == 0xB7
-        || (0x0300..=0x036F).contains(&u)
-        || (0x203F..=0x2040).contains(&u)
+    u == 0xB7 || (0x0300..=0x036F).contains(&u) || (0x203F..=0x2040).contains(&u)
 }
 
 fn is_ncname(s: &str) -> bool {

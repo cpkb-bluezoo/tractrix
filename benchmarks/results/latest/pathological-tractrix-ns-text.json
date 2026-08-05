@@ -1,1 +1,1 @@
-{"parser":"tractrix","config":"ns","file_count":1,"total_bytes":67108929,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.440192],"median_sec":0.440192,"mb_per_sec":145.391,"peak_rss_bytes":69484544,"errors":[]}
+{"parser":"tractrix","config":"ns","file_count":1,"total_bytes":67108929,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.258104],"median_sec":0.258104,"mb_per_sec":247.962,"peak_rss_bytes":69419008,"errors":[]}

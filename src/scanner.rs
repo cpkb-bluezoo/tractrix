@@ -62,7 +62,7 @@ struct ExtPe {
 /// the Java method parameters of the same names.
 #[derive(Default)]
 struct PendingDecls {
-    entities: HashMap<String, String>,
+    entities: HashMap<String, Rc<[char]>>,
     external_names: HashMap<String, ExtEntity>,
     param_entities: HashMap<String, Rc<[char]>>,
     param_external_names: HashMap<String, ExtPe>,
@@ -144,7 +144,7 @@ pub struct Scanner<'a> {
     doctype_public_id: Option<String>,
     doctype_system_id: Option<String>,
 
-    general_entities: HashMap<String, String>,
+    general_entities: HashMap<String, Rc<[char]>>,
     external_entity_names: HashMap<String, ExtEntity>,
     parameter_entities: HashMap<String, Rc<[char]>>,
     parameter_entity_external_ids: HashMap<String, ExtPe>,
@@ -239,10 +239,14 @@ fn is_legal_literal_char_xml11(c: char) -> bool {
 }
 
 fn is_name_start_char(c: char) -> bool {
-    let u = c as u32;
-    if c == ':' || c == '_' || c.is_ascii_uppercase() || c.is_ascii_lowercase() {
-        return true;
+    // ASCII names (letters, plus ':'/'_') are overwhelmingly the common
+    // case, and every character below this range is definitionally
+    // excluded from all the ranges checked below — so for any ASCII
+    // input, whether it matches or not, there's nothing left to check.
+    if c.is_ascii() {
+        return c == ':' || c == '_' || c.is_ascii_alphabetic();
     }
+    let u = c as u32;
     (0xC0..=0xD6).contains(&u)
         || (0xD8..=0xF6).contains(&u)
         || (0xF8..=0x2FF).contains(&u)
@@ -258,14 +262,14 @@ fn is_name_start_char(c: char) -> bool {
 }
 
 fn is_name_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c == ':' || c == '_' || c == '-' || c == '.' || c.is_ascii_alphanumeric();
+    }
     if is_name_start_char(c) {
         return true;
     }
     let u = c as u32;
-    c == '-'
-        || c == '.'
-        || c.is_ascii_digit()
-        || u == 0xB7
+    u == 0xB7
         || (0x0300..=0x036F).contains(&u)
         || (0x203F..=0x2040).contains(&u)
 }
@@ -660,7 +664,6 @@ impl<'a> Scanner<'a> {
     // ===== Buffer management =====
 
     fn append(&mut self, data: &str) {
-        let needed = data.chars().count();
         if self.pos > 0 {
             let remaining = self.limit - self.pos;
             if remaining > 0 {
@@ -669,17 +672,25 @@ impl<'a> Scanner<'a> {
             self.limit = remaining;
             self.pos = 0;
         }
-        if self.limit + needed > self.buf.len() {
+        // `data.len()` (bytes) is always >= its char count, so it's a safe
+        // upper bound for the resize check — this avoids a full decode-and-
+        // count pass over `data` just to learn a number the write loop
+        // below produces for free as a side effect. Worst case (all-ASCII)
+        // it matches exactly; multi-byte input just over-reserves a little,
+        // which the amortized doubling below already tolerates fine.
+        if self.limit + data.len() > self.buf.len() {
             let mut newcap = self.buf.len().max(1) * 2;
-            while newcap < self.limit + needed {
+            while newcap < self.limit + data.len() {
                 newcap *= 2;
             }
             self.buf.resize(newcap, '\u{0}');
         }
-        for (i, c) in data.chars().enumerate() {
-            self.buf[self.limit + i] = c;
+        let mut i = self.limit;
+        for c in data.chars() {
+            self.buf[i] = c;
+            i += 1;
         }
-        self.limit += needed;
+        self.limit = i;
     }
 
     fn slice(&self, start: usize, end: usize) -> String {
@@ -709,13 +720,13 @@ impl<'a> Scanner<'a> {
     // ===== Whole-DTD end-of-document checks =====
 
     fn check_entity_values_do_not_reference_unparsed_entities(&mut self) -> ParseResult<()> {
-        let entries: Vec<(String, String)> = self
+        let entries: Vec<(String, Rc<[char]>)> = self
             .general_entities
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), Rc::clone(v)))
             .collect();
         for (key, value) in entries {
-            let chars: Vec<char> = value.chars().collect();
+            let chars: &[char] = &value;
             let len = chars.len();
             let mut q = 0;
             while q < len {
@@ -2376,7 +2387,8 @@ impl<'a> Scanner<'a> {
                 && !self.general_entities.contains_key(&name)
                 && !self.external_entity_names.contains_key(&name)
             {
-                pending.entities.insert(name.clone(), sb.clone());
+                let decoded: Rc<[char]> = sb.chars().collect::<Vec<char>>().into();
+                pending.entities.insert(name.clone(), decoded);
                 self.handler.internal_entity_decl(&name, &sb)?;
                 if self.last_literal_contained_restricted_char {
                     self.restricted_char_entities.insert(name.clone());
@@ -3641,7 +3653,10 @@ impl<'a> Scanner<'a> {
             )?;
             replacement_chars = self.strip_declaration(&fetched)?;
         } else {
-            replacement_chars = self.general_entities.get(name).unwrap().chars().collect();
+            // self.buf must be a uniquely-owned Vec<char> (see
+            // expand_parameter_entity_reference) — a plain slice memcpy
+            // from the shared Rc, not a UTF-8 re-decode.
+            replacement_chars = self.general_entities.get(name).unwrap().to_vec();
         }
 
         self.entity_expansion_stack.push(name.to_string());
@@ -3702,11 +3717,13 @@ impl<'a> Scanner<'a> {
         if !self.check_entity_referenceable(name, false)? {
             return Ok(String::new());
         }
-        let replacement = self.general_entities.get(name).cloned().unwrap_or_default();
+        // A refcount bump, not a String clone + re-decode: the replacement
+        // text is identical on every reference to this entity, so there's
+        // nothing to gain from copying it fresh each time.
+        let replacement: Rc<[char]> = self.general_entities.get(name).cloned().unwrap_or_default();
         self.entity_expansion_stack.push(name.to_string());
-        let rbuf: Vec<char> = replacement.chars().collect();
         let context = format!("entity \"{name}\"");
-        let result = self.resolve_attribute_text(&rbuf, &context);
+        let result = self.resolve_attribute_text(&replacement, &context);
         self.entity_expansion_stack.pop();
         result
     }

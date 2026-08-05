@@ -1,1 +1,1 @@
-{"parser":"quick-xml","config":"ns","file_count":1,"total_bytes":67108919,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.059475],"median_sec":0.059475,"mb_per_sec":1076.089,"peak_rss_bytes":138133504,"errors":[]}
+{"parser":"quick-xml","config":"ns","file_count":1,"total_bytes":67108919,"iterations":1,"warmup_discarded":0,"wall_times_sec":[0.057562],"median_sec":0.057562,"mb_per_sec":1111.850,"peak_rss_bytes":138117120,"errors":[]}

@@ -9,6 +9,8 @@
 //! Charset decoding uses `encoding_rs` for everything it supports; UTF-32
 //! (which `encoding_rs` does not implement) is decoded manually.
 
+use std::borrow::Cow;
+
 use bytes::Bytes;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 
@@ -715,8 +717,12 @@ impl ExternalEntityDecoder {
             DecodeEngine::Enc(dec) => {
                 // Reserve a generous capacity; decode in one shot (encoding_rs
                 // buffers partial trailing sequences internally across calls).
-                let mut out = String::with_capacity(bytes.len() + 16);
-                let (_res, _read, had_errors) = dec.decode_to_string(bytes, &mut out, last);
+                // decode_to_string appends rather than replacing, and
+                // `decoded` starts empty, so decoding straight into it is
+                // equivalent to the old decode-into-`out`-then-push_str —
+                // minus a full copy of every chunk's content.
+                decoded.reserve(bytes.len() + 16);
+                let (_res, _read, had_errors) = dec.decode_to_string(bytes, &mut decoded, last);
                 if had_errors {
                     if last {
                         // Incomplete trailing sequence at EOF.
@@ -726,7 +732,6 @@ impl ExternalEntityDecoder {
                             .fatal_error("Malformed byte sequence in the document's character encoding"));
                     }
                 }
-                decoded.push_str(&out);
             }
             DecodeEngine::Utf32 { little_endian, rem } => {
                 let le = *little_endian;
@@ -770,7 +775,21 @@ impl ExternalEntityDecoder {
         Ok(())
     }
 
-    fn normalize_line_endings(&mut self, s: &str) -> String {
+    fn normalize_line_endings<'s>(&mut self, s: &'s str) -> Cow<'s, str> {
+        // The overwhelmingly common case is a chunk with no '\r' (and, in
+        // non-XML-1.1 documents, no NEL/LS either) and no CR/LF pair split
+        // across the previous chunk boundary — nothing to rewrite, so skip
+        // building a whole new String and hand the input straight through.
+        let crlf_split_at_boundary = self.last_char == '\r' && s.starts_with('\n');
+        let needs_rewrite = crlf_split_at_boundary
+            || s.contains('\r')
+            || (self.xml11 && (s.contains('\u{85}') || s.contains('\u{2028}')));
+        if !needs_rewrite {
+            if let Some(c) = s.chars().next_back() {
+                self.last_char = c;
+            }
+            return Cow::Borrowed(s);
+        }
         let mut out = String::with_capacity(s.len());
         let mut last = self.last_char;
         for c in s.chars() {
@@ -786,7 +805,7 @@ impl ExternalEntityDecoder {
             last = c;
         }
         self.last_char = last;
-        out
+        Cow::Owned(out)
     }
 }
 
