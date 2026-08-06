@@ -1,6 +1,6 @@
 # Benchmark results
 
-Generated: 2026-08-05T15:12:45Z
+Generated: 2026-08-06T05:57:44Z
 
 Versions: Expat 2.8.2 · libxml2 2.15.3 · quick-xml 0.39.0 · chunk size 32768 bytes · 10 iterations (first discarded as warm-up)
 
@@ -12,12 +12,12 @@ Corpus: 1206 well-formed files (Tier 1) / 417 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Files | Corpus (MB) | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| expat | ns | no-op sink | 1206 | 3.21 | 0.0336 | 95.6 | 6.5 | **2** (see below) |
-| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 417 | 0.10 | 0.0088 | 11.0 | 4.1 | **2** (see below) |
-| quick-xml | ns | no-op sink | 1206 | 3.21 | 0.0115 | 280.1 | 6.8 | **3** (see below) |
-| tractrix | ns+dtd | no-op sink (RecordingHandler — tracks error() only) | 417 | 0.10 | 0.0179 | 5.4 | 6.0 | 0 |
-| tractrix | ns | no-op sink (RecordingHandler — tracks error() only) | 1206 | 3.21 | 0.0408 | 78.6 | 8.6 | 0 |
-| tractrix | skip | no-op sink (RecordingHandler — tracks error() only) | 1206 | 3.21 | 0.0294 | 109.0 | 8.5 | **1** (see below) |
+| expat | ns | no-op sink | 1206 | 3.21 | 0.0340 | 94.4 | 6.4 | **2** (see below) |
+| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 417 | 0.10 | 0.0088 | 11.0 | 4.0 | **2** (see below) |
+| quick-xml | ns | no-op sink | 1206 | 3.21 | 0.0114 | 280.7 | 6.8 | **3** (see below) |
+| tractrix | ns+dtd | no-op sink (RecordingHandler — tracks error() only) | 417 | 0.10 | 0.0172 | 5.6 | 6.0 | 0 |
+| tractrix | ns | no-op sink (RecordingHandler — tracks error() only) | 1206 | 3.21 | 0.0278 | 115.6 | 8.7 | 0 |
+| tractrix | skip | no-op sink (RecordingHandler — tracks error() only) | 1206 | 3.21 | 0.0245 | 131.0 | 8.6 | **1** (see below) |
 
 
 ## Pathological case (single huge token)
@@ -26,14 +26,14 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 
 | Parser | Config | Document | Peak RSS (MB) | Time (s) |
 |---|---|---|---:|---:|
-| expat | ns | attribute | 259.8 | 0.5976 |
-| expat | ns | text/CDATA | 65.6 | 0.2417 |
-| libxml2 | ns+dtd | attribute | 259.0 | 0.3518 |
-| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3547 |
-| quick-xml | ns | attribute | 131.7 | 0.0583 |
-| quick-xml | ns | text/CDATA | 131.7 | 0.0120 |
-| tractrix | ns | attribute | 66.3 | 0.2876 |
-| tractrix | ns | text/CDATA | 66.2 | 0.2603 |
+| expat | ns | attribute | 259.8 | 0.5638 |
+| expat | ns | text/CDATA | 65.6 | 0.2415 |
+| libxml2 | ns+dtd | attribute | 259.0 | 0.3430 |
+| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3768 |
+| quick-xml | ns | attribute | 131.7 | 0.0593 |
+| quick-xml | ns | text/CDATA | 131.7 | 0.0130 |
+| tractrix | ns | attribute | 66.1 | 0.1084 |
+| tractrix | ns | text/CDATA | 66.1 | 0.1282 |
 
 ## Errors
 
