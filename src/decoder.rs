@@ -438,6 +438,12 @@ pub struct ExternalEntityDecoder {
     engine: Option<DecodeEngine>,
     last_char: char,
     had_incomplete: bool,
+    /// Exploratory (explore/utf8-byte-path): set once, in
+    /// `setup_charset_decoder`, when UTF-8 is confirmed for a non-XML-1.1
+    /// document. From then on `feed_content` skips `encoding_rs` entirely
+    /// and hands raw (CR/CRLF-normalized) bytes straight to the scanner's
+    /// byte-native path via `Scanner::receive_bytes`.
+    bytes_mode: bool,
 }
 
 impl ExternalEntityDecoder {
@@ -452,6 +458,7 @@ impl ExternalEntityDecoder {
             engine: None,
             last_char: '\u{0}',
             had_incomplete: false,
+            bytes_mode: false,
         }
     }
 
@@ -464,6 +471,7 @@ impl ExternalEntityDecoder {
         self.engine = None;
         self.last_char = '\u{0}';
         self.had_incomplete = false;
+        self.bytes_mode = false;
     }
 
     pub fn receive(&mut self, data: Bytes, scanner: &mut Scanner<'_>) -> ParseResult<()> {
@@ -484,7 +492,7 @@ impl ExternalEntityDecoder {
         // flush the decoder.
         let empty = Bytes::new();
         self.advance(&empty, true, scanner)?;
-        if self.had_incomplete {
+        if self.had_incomplete || (self.bytes_mode && scanner.has_incomplete_trailing_bytes()) {
             let name = self
                 .charset
                 .as_ref()
@@ -663,6 +671,28 @@ impl ExternalEntityDecoder {
             self.bom_default_charset()
         };
         scanner.set_encoding(&charset.name());
+        // Exploratory (explore/utf8-byte-path): this is the exact "charset
+        // is decided" moment — BOM detection and the XMLDecl/TextDecl
+        // parse above are already byte-only, and neither has fed the
+        // scanner anything yet (the declaration itself is consumed here in
+        // the decoder, never forwarded as content), so the scanner's
+        // buffer is still pristine. That makes this the clean fork point:
+        // switch it to byte mode right here, before any content arrives.
+        //
+        // Scoped to `!self.xml11` for now: byte-mode line-ending
+        // normalization (`normalize_line_endings_bytes`) only recognizes
+        // CR/CRLF, not XML 1.1's additional NEL/LS line endings, so an
+        // XML 1.1 document keeps going through the existing, unmodified
+        // decode-to-`Vec<char>` path. XML 1.1 is rare in practice, and
+        // this keeps the byte path's line-ending handling simple and
+        // provably correct rather than needing to reason about a NEL/LS
+        // byte sequence split across a chunk boundary.
+        let is_utf8 = matches!(&charset, Charset::Enc(e) if *e == UTF_8);
+        scanner.set_utf8_confirmed(is_utf8);
+        if is_utf8 && !self.xml11 {
+            scanner.switch_to_bytes_mode();
+            self.bytes_mode = true;
+        }
         self.engine = Some(match &charset {
             Charset::Utf16Le => DecodeEngine::Enc(UTF_16LE.new_decoder_without_bom_handling()),
             Charset::Utf16Be => DecodeEngine::Enc(UTF_16BE.new_decoder_without_bom_handling()),
@@ -712,6 +742,16 @@ impl ExternalEntityDecoder {
     }
 
     fn feed_content(&mut self, bytes: &[u8], last: bool, scanner: &mut Scanner<'_>) -> ParseResult<()> {
+        if self.bytes_mode {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let normalized = self.normalize_line_endings_bytes(bytes);
+            if !normalized.is_empty() {
+                scanner.receive_bytes(&normalized)?;
+            }
+            return Ok(());
+        }
         let mut decoded = String::new();
         match self.engine.as_mut().unwrap() {
             DecodeEngine::Enc(dec) => {
@@ -806,6 +846,46 @@ impl ExternalEntityDecoder {
         }
         self.last_char = last;
         Cow::Owned(out)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `normalize_line_endings`, operating on raw (undecoded) UTF-8 bytes.
+    /// Only recognizes CR/CRLF, not XML 1.1's NEL/LS — `bytes_mode` is
+    /// never entered for an XML 1.1 document (see `setup_charset_decoder`),
+    /// so that's never a gap in practice. Safe to scan for the single-byte
+    /// `\r`/`\n` values directly without decoding: no UTF-8 continuation
+    /// byte (0x80-0xBF) or multi-byte lead byte can ever equal either one,
+    /// so this can't misfire mid-sequence, and a CR/LF pair can never
+    /// itself span more than the two ASCII bytes it's built from — so,
+    /// unlike a hypothetical NEL/LS byte-pattern search, there's no
+    /// chunk-boundary case to reason about here at all. Reuses
+    /// `self.last_char` (storing the last raw byte via `as char`) rather
+    /// than adding a redundant field — a document is either fully
+    /// `bytes_mode` or fully not, decided once and never both, so the two
+    /// normalizers never interleave on the same field.
+    fn normalize_line_endings_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let crlf_split_at_boundary = self.last_char == '\r' && bytes.first() == Some(&b'\n');
+        let needs_rewrite = crlf_split_at_boundary || bytes.contains(&b'\r');
+        if !needs_rewrite {
+            if let Some(&b) = bytes.last() {
+                self.last_char = b as char;
+            }
+            return bytes.to_vec();
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut last = self.last_char as u32 as u8;
+        for &b in bytes {
+            if b == b'\r' {
+                out.push(b'\n');
+            } else if b == b'\n' && last == b'\r' {
+                // CR LF pair: drop the LF (CR already converted).
+            } else {
+                out.push(b);
+            }
+            last = b;
+        }
+        self.last_char = last as char;
+        out
     }
 }
 

@@ -114,4 +114,62 @@ impl<'a> Parser<'a> {
     pub fn is_standalone(&self) -> bool {
         self.scanner.is_standalone()
     }
+
+    /// Exploratory (explore/utf8-byte-path): whether the decoder confirmed
+    /// genuine UTF-8. Not public API — an internal hook for milestone-one
+    /// detection tests, ahead of anything actually using it.
+    #[cfg(test)]
+    pub(crate) fn is_utf8_confirmed(&self) -> bool {
+        self.scanner.is_utf8_confirmed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::FeatureSet;
+    use crate::handler::DefaultHandler;
+
+    fn detect(bytes: &'static [u8]) -> bool {
+        let mut app = DefaultHandler;
+        let features = FeatureSet::default();
+        let mut parser = Parser::new(&mut app, &features, None, None, None).unwrap();
+        parser.parse_all(Bytes::from_static(bytes)).unwrap();
+        parser.is_utf8_confirmed()
+    }
+
+    #[test]
+    fn utf8_confirmed_with_no_signal_at_all() {
+        // No BOM, no declaration at all — the XML-spec default is UTF-8.
+        assert!(detect(b"<root/>"));
+    }
+
+    #[test]
+    fn utf8_confirmed_with_explicit_declaration() {
+        assert!(detect(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>"));
+    }
+
+    #[test]
+    fn utf8_confirmed_with_utf8_bom() {
+        assert!(detect(b"\xEF\xBB\xBF<root/>"));
+    }
+
+    #[test]
+    fn utf8_confirmed_false_for_declared_latin1() {
+        assert!(!detect(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root/>"));
+    }
+
+    #[test]
+    fn utf8_confirmed_false_for_utf16_bom() {
+        // UTF-16LE BOM, "<root/>" as UTF-16LE code units.
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+        for c in "<root/>".encode_utf16() {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut app = DefaultHandler;
+        let features = FeatureSet::default();
+        let mut parser = Parser::new(&mut app, &features, None, None, None).unwrap();
+        parser.parse_all(Bytes::from(bytes)).unwrap();
+        assert!(!parser.is_utf8_confirmed());
+    }
 }

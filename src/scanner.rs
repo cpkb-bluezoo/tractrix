@@ -13,7 +13,10 @@
 //! `xmlns` as a plain attribute.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::{Index, IndexMut, Range};
 use std::rc::Rc;
+
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::decoder;
 use crate::dtd::{
@@ -29,6 +32,84 @@ use crate::names::PackedName;
 
 const INITIAL_CAPACITY: usize = 8192;
 
+/// Exploratory (explore/utf8-byte-path): the scanner's canonical input
+/// storage. Which variant is active is decided once, at charset-detection
+/// time (`ExternalEntityDecoder::setup_charset_decoder`), and never
+/// changes mid-document — `self.pos`/`self.limit` are byte offsets when
+/// `Bytes` is active, char indices when `Chars` is active.
+///
+/// `Index`/`IndexMut` are implemented directly on this type so every
+/// existing `self.buf[i]`/`self.buf[a..b]` call site in the current
+/// char-based scanning code keeps compiling completely unchanged — only
+/// the non-indexing operations (`.len()`, `.resize()`, buffer swaps, etc.)
+/// need to go through `as_chars()`/`as_chars_mut()` explicitly. New
+/// byte-native sibling functions go through `as_bytes()`/`as_bytes_mut()`
+/// instead.
+enum ScanBuffer {
+    /// Confirmed genuine UTF-8: raw bytes, scanned directly, no decode
+    /// pass. `BytesMut` (not `Vec<u8>`) specifically because its `reserve`
+    /// only shifts/reallocates when actually necessary — unlike the
+    /// current char path's `append`, which shifts unconditionally — and
+    /// growing it never needs a zero-fill the way `Vec<char>` does (`u8`
+    /// has no invalid bit pattern; `char` does).
+    Bytes(BytesMut),
+    /// Any other charset: already decoded by `ExternalEntityDecoder`,
+    /// exactly as today.
+    Chars(Vec<char>),
+}
+
+impl ScanBuffer {
+    fn as_chars(&self) -> &Vec<char> {
+        match self {
+            ScanBuffer::Chars(c) => c,
+            ScanBuffer::Bytes(_) => unreachable!("scanner is in byte mode"),
+        }
+    }
+
+    fn as_chars_mut(&mut self) -> &mut Vec<char> {
+        match self {
+            ScanBuffer::Chars(c) => c,
+            ScanBuffer::Bytes(_) => unreachable!("scanner is in byte mode"),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn as_bytes(&self) -> &BytesMut {
+        match self {
+            ScanBuffer::Bytes(b) => b,
+            ScanBuffer::Chars(_) => unreachable!("scanner is in char mode"),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn as_bytes_mut(&mut self) -> &mut BytesMut {
+        match self {
+            ScanBuffer::Bytes(b) => b,
+            ScanBuffer::Chars(_) => unreachable!("scanner is in char mode"),
+        }
+    }
+}
+
+impl Index<usize> for ScanBuffer {
+    type Output = char;
+    fn index(&self, i: usize) -> &char {
+        &self.as_chars()[i]
+    }
+}
+
+impl IndexMut<usize> for ScanBuffer {
+    fn index_mut(&mut self, i: usize) -> &mut char {
+        &mut self.as_chars_mut()[i]
+    }
+}
+
+impl Index<Range<usize>> for ScanBuffer {
+    type Output = [char];
+    fn index(&self, r: Range<usize>) -> &[char] {
+        &self.as_chars()[r]
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KwResult {
     Match,
@@ -36,6 +117,7 @@ enum KwResult {
     NeedMore,
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum RefResult {
     NeedMore,
     Decoded(String),
@@ -44,6 +126,7 @@ enum RefResult {
 
 /// External general entity identifiers: `(publicId, systemId, ndataName)`.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 struct ExtEntity {
     public_id: Option<String>,
     system_id: Option<String>,
@@ -92,10 +175,16 @@ pub struct Scanner<'a> {
     handler: &'a mut dyn XmlHandler,
     locator: DocumentLocator,
     encoding: Option<String>,
+    /// Set once the decoder has confirmed the document's bytes are genuine
+    /// UTF-8 (explicit `encoding="UTF-8"`, a UTF-8 BOM, or no signal at all
+    /// — the XML-spec default) — see ExternalEntityDecoder::setup_charset_decoder.
+    /// Exploratory: not yet acted on by the scanner itself, this is step
+    /// one of the parallel UTF-8 byte-path work (see explore/utf8-byte-path).
+    utf8_confirmed: bool,
     document_started: bool,
     defer_document_start_until_encoding: bool,
 
-    buf: Vec<char>,
+    buf: ScanBuffer,
     pos: usize,
     limit: usize,
     /// Reused across `slice_and` calls to avoid a fresh allocation for
@@ -206,6 +295,87 @@ pub struct Scanner<'a> {
 }
 
 // ===== Character classification =====
+
+/// Exploratory (explore/utf8-byte-path): outcome of one byte-native
+/// content-run scan. See `Scanner::scan_content_run_bytes`.
+#[derive(Debug, PartialEq, Eq)]
+enum ContentRunBytes {
+    /// Reached a structural stop byte (`<` or `&`).
+    Stop,
+    /// No more buffered bytes, or a trailing multi-byte sequence that
+    /// isn't fully buffered yet — wait for the next chunk.
+    NeedMore,
+    /// Ill-formed UTF-8, or a codepoint that isn't a legal literal XML
+    /// character and isn't covered by the restricted-char-in-content
+    /// carve-out.
+    Illegal,
+}
+
+/// Exploratory (explore/utf8-byte-path): outcome of one byte-native
+/// attribute-value run scan. See `Scanner::scan_attr_value_run_bytes`.
+#[derive(Debug, PartialEq, Eq)]
+enum AttrValueRunBytes {
+    /// Reached the closing quote.
+    Quote,
+    /// Reached `&` — an entity/character reference to resolve.
+    Amp,
+    /// No more buffered bytes, or a trailing multi-byte sequence that
+    /// isn't fully buffered yet.
+    NeedMore,
+    /// `<` appeared in the attribute value (always a fatal WF error),
+    /// ill-formed UTF-8, or an illegal literal character.
+    Illegal,
+}
+
+/// Exploratory (explore/utf8-byte-path): outcome of one call to
+/// `Scanner::scan_attribute_value_streaming_bytes`.
+#[derive(Debug, PartialEq, Eq)]
+enum AttrValueScanBytes {
+    /// Reached the closing quote; the full value has been emitted to the
+    /// handler already.
+    Done,
+    /// No more buffered bytes; wait for the next chunk.
+    NeedMore,
+}
+
+/// Exploratory (explore/utf8-byte-path): outcome of one call to
+/// `Scanner::scan_name_chars_bytes`.
+#[derive(Debug, PartialEq, Eq)]
+enum NameScanBytes {
+    /// Ran off the end of a legal NameChar run; the `usize` is the
+    /// position just past it (mirrors `p` in the char-based loops).
+    End(usize),
+    /// No more buffered bytes; wait for the next chunk.
+    NeedMore,
+    /// Hit invalid UTF-8 mid-name.
+    Illegal,
+}
+
+/// Exploratory (explore/utf8-byte-path): outcome of one call to
+/// `Scanner::scan_until_byte_bytes`, carrying the position reached either
+/// way (unlike `ContentRunBytes`/`AttrValueRunBytes`, callers here need
+/// the in-progress position on `NeedMore` too, to emit a partial run).
+#[derive(Debug, PartialEq, Eq)]
+enum LiteralUntilBytes {
+    Stop(usize),
+    NeedMore(usize),
+}
+
+/// Exploratory (explore/utf8-byte-path): total byte length of the UTF-8
+/// sequence starting with lead byte `b` (2-4), or 0 if `b` isn't a valid
+/// lead byte (e.g. a stray continuation byte).
+#[allow(dead_code)]
+fn utf8_seq_len(b: u8) -> usize {
+    if b & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if b & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if b & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        0
+    }
+}
 
 fn is_ws(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n' || c == '\r'
@@ -336,6 +506,22 @@ fn match_predefined(arr: &[char], start: usize, len: usize) -> Option<&'static s
     }
 }
 
+/// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+/// `match_predefined`. The five predefined entity names are all pure
+/// ASCII, so this is a direct byte-slice comparison — no decoding
+/// involved regardless of which path is calling it.
+#[allow(dead_code)]
+fn match_predefined_bytes(name: &[u8]) -> Option<&'static str> {
+    match name {
+        b"amp" => Some("&"),
+        b"lt" => Some("<"),
+        b"gt" => Some(">"),
+        b"apos" => Some("'"),
+        b"quot" => Some("\""),
+        _ => None,
+    }
+}
+
 fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;
@@ -403,9 +589,10 @@ impl<'a> Scanner<'a> {
             handler,
             locator,
             encoding: None,
+            utf8_confirmed: false,
             document_started: false,
             defer_document_start_until_encoding,
-            buf: vec!['\u{0}'; INITIAL_CAPACITY],
+            buf: ScanBuffer::Chars(vec!['\u{0}'; INITIAL_CAPACITY]),
             pos: 0,
             limit: 0,
             scratch: String::new(),
@@ -505,13 +692,32 @@ impl<'a> Scanner<'a> {
         self.encoding.as_deref()
     }
 
+    /// Exploratory (explore/utf8-byte-path): records whether the decoder
+    /// confirmed genuine UTF-8 bytes (explicit `encoding="UTF-8"`, a UTF-8
+    /// BOM, or no signal at all — the XML-spec default). Not yet acted on;
+    /// this is the milestone-one detection hook, verified by unit tests
+    /// against `is_utf8_confirmed()` before anything is built on top of it.
+    pub(crate) fn set_utf8_confirmed(&mut self, confirmed: bool) {
+        self.utf8_confirmed = confirmed;
+    }
+
+    pub(crate) fn is_utf8_confirmed(&self) -> bool {
+        self.utf8_confirmed
+    }
+
     /// Resets all streaming/parse state so the scanner can parse a fresh
     /// document with the same handler, resolver, and settings.
     pub fn reset(&mut self) {
         self.encoding = None;
+        self.utf8_confirmed = false;
         self.document_started = false;
-        self.buf.clear();
-        self.buf.resize(INITIAL_CAPACITY, '\u{0}');
+        // A prior document may have switched this scanner into byte mode
+        // (see `switch_to_bytes_mode`); reassigning outright — rather than
+        // clearing/resizing the existing buffer in place — is what
+        // actually discards that and returns to the char-mode buffer this
+        // scanner starts with, regardless of which variant it's currently
+        // in.
+        self.buf = ScanBuffer::Chars(vec!['\u{0}'; INITIAL_CAPACITY]);
         self.pos = 0;
         self.limit = 0;
         self.in_start_tag = false;
@@ -629,6 +835,44 @@ impl<'a> Scanner<'a> {
         self.handler.save_buffers()
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `receive`, called by `ExternalEntityDecoder` once it has switched
+    /// this scanner into byte mode. The decoder still normalizes line
+    /// endings (CR/CRLF -> LF) before calling this, on raw UTF-8 bytes
+    /// rather than decoded chars — see
+    /// `ExternalEntityDecoder::normalize_line_endings_bytes`. Byte mode is
+    /// only ever entered for XML 1.0 documents (see
+    /// `setup_charset_decoder`'s `use_bytes_mode` computation), so this
+    /// path never needs to recognize NEL/LS as line endings — only XML 1.1
+    /// does, and that document class simply never switches to byte mode.
+    pub(crate) fn receive_bytes(&mut self, data: &[u8]) -> ParseResult<()> {
+        self.append_bytes(data);
+        self.scan_bytes()?;
+        self.handler.save_buffers()
+    }
+
+    /// Exploratory (explore/utf8-byte-path): true when the scanner is in
+    /// byte mode and `self.pos` sits at a multi-byte UTF-8 lead byte whose
+    /// continuation bytes never fully arrived. Every byte-native scan
+    /// function advances `self.pos` as far as legally possible before
+    /// reporting `NeedMore`, so if that outcome was specifically "waiting
+    /// on more bytes of this one sequence" (as opposed to any other reason
+    /// to pause, e.g. waiting for a closing quote or `>`), `self.pos` is
+    /// left exactly at that sequence's first byte. Checked only at
+    /// `close()`, mirroring how the char path's `had_incomplete` is only
+    /// surfaced there too.
+    pub(crate) fn has_incomplete_trailing_bytes(&self) -> bool {
+        if !matches!(self.buf, ScanBuffer::Bytes(_)) || self.pos >= self.limit {
+            return false;
+        }
+        let b = self.buf.as_bytes()[self.pos];
+        if b < 0x80 {
+            return false;
+        }
+        let seq_len = utf8_seq_len(b);
+        seq_len == 0 || self.pos + seq_len > self.limit
+    }
+
     pub fn close(&mut self) -> ParseResult<()> {
         if !self.document_started {
             self.start_document()?;
@@ -667,7 +911,7 @@ impl<'a> Scanner<'a> {
         if self.pos > 0 {
             let remaining = self.limit - self.pos;
             if remaining > 0 {
-                self.buf.copy_within(self.pos..self.limit, 0);
+                self.buf.as_chars_mut().copy_within(self.pos..self.limit, 0);
             }
             self.limit = remaining;
             self.pos = 0;
@@ -678,12 +922,12 @@ impl<'a> Scanner<'a> {
         // below produces for free as a side effect. Worst case (all-ASCII)
         // it matches exactly; multi-byte input just over-reserves a little,
         // which the amortized doubling below already tolerates fine.
-        if self.limit + data.len() > self.buf.len() {
-            let mut newcap = self.buf.len().max(1) * 2;
+        if self.limit + data.len() > self.buf.as_chars().len() {
+            let mut newcap = self.buf.as_chars().len().max(1) * 2;
             while newcap < self.limit + data.len() {
                 newcap *= 2;
             }
-            self.buf.resize(newcap, '\u{0}');
+            self.buf.as_chars_mut().resize(newcap, '\u{0}');
         }
         let mut i = self.limit;
         for c in data.chars() {
@@ -691,6 +935,38 @@ impl<'a> Scanner<'a> {
             i += 1;
         }
         self.limit = i;
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `append`. Not yet reachable from `ExternalEntityDecoder` — that
+    /// wiring (skipping the decode-to-`Vec<char>` step entirely when UTF-8
+    /// is confirmed) is a later milestone. `BytesMut::advance` drops the
+    /// consumed prefix without necessarily shifting memory, and `reserve`
+    /// only shifts/reallocates when it's actually short on room — no
+    /// unconditional copy_within, no zero-fill (see `ScanBuffer::Bytes`'s
+    /// doc comment for why both of those are real costs on the char path).
+    #[allow(dead_code)]
+    fn append_bytes(&mut self, data: &[u8]) {
+        if self.pos > 0 {
+            self.buf.as_bytes_mut().advance(self.pos);
+            self.pos = 0;
+        }
+        let buf = self.buf.as_bytes_mut();
+        buf.reserve(data.len());
+        buf.put_slice(data);
+        self.limit = buf.len();
+    }
+
+    /// Exploratory (explore/utf8-byte-path): switches the scanner from its
+    /// default char-mode buffer to an empty byte-mode buffer. Called for
+    /// real by `ExternalEntityDecoder::setup_charset_decoder` once UTF-8 is
+    /// confirmed (and, for now, the document isn't XML 1.1 — see
+    /// `receive_bytes`'s doc comment); also doubles as test setup for the
+    /// byte-native scanning primitives above.
+    pub(crate) fn switch_to_bytes_mode(&mut self) {
+        self.buf = ScanBuffer::Bytes(BytesMut::new());
+        self.pos = 0;
+        self.limit = 0;
     }
 
     fn slice(&self, start: usize, end: usize) -> String {
@@ -711,6 +987,33 @@ impl<'a> Scanner<'a> {
         // O(1), no allocation), so `f(self, &chunk)` has no overlapping
         // borrows even though `f` takes `&mut Self`. Putting it back after
         // preserves its capacity for the next call.
+        let chunk = std::mem::take(&mut self.scratch);
+        let result = f(self, &chunk);
+        self.scratch = chunk;
+        result
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `slice_and`. `emit_attribute_value_content` and friends never touch
+    /// `self.buf` themselves — they only operate on the `&str` chunk
+    /// they're handed — so reusing them from the byte path needs nothing
+    /// more than a valid `&str` view over a byte range. `push_str` here is
+    /// a raw memcpy of bytes already known to be well-formed UTF-8 (the
+    /// byte-native scanners only ever advance `pos` past ranges they've
+    /// validated), not a per-char encode like `slice_and`'s `extend` — so
+    /// this does strictly less work per call, copy included.
+    #[allow(dead_code)]
+    fn slice_and_bytes<F>(&mut self, start: usize, end: usize, f: F) -> ParseResult<()>
+    where
+        F: FnOnce(&mut Self, &str) -> ParseResult<()>,
+    {
+        self.scratch.clear();
+        // SAFETY: [start, end) was only ever advanced past by
+        // scan_content_run_bytes/scan_attr_value_run_bytes, both of which
+        // validate every non-ASCII sequence via `std::str::from_utf8`
+        // before accepting it — this range is already known-valid UTF-8.
+        let bytes = &self.buf.as_bytes()[start..end];
+        self.scratch.push_str(unsafe { std::str::from_utf8_unchecked(bytes) });
         let chunk = std::mem::take(&mut self.scratch);
         let result = f(self, &chunk);
         self.scratch = chunk;
@@ -985,11 +1288,161 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_content_run_fast`. Advances `self.pos` by whole codepoints —
+    /// 1 byte for ASCII, checked with the same printable-ASCII fast path
+    /// as `is_content_stop`, or the full sequence length for non-ASCII,
+    /// decoded only far enough to validate legality (most real text never
+    /// takes that branch at all). `NeedMore` covers both "no more buffered
+    /// bytes at all" and "a trailing multi-byte sequence isn't fully
+    /// buffered yet" — a distinction the char path never needs, since
+    /// encoding_rs's decoder already absorbs incomplete trailing sequences
+    /// before Scanner ever sees a char.
+    #[allow(dead_code)]
+    fn scan_content_run_bytes(&mut self) -> ContentRunBytes {
+        loop {
+            if self.pos >= self.limit {
+                return ContentRunBytes::NeedMore;
+            }
+            let b = self.buf.as_bytes()[self.pos];
+            if (0x20..=0x7E).contains(&b) {
+                match b {
+                    b'<' | b'&' => return ContentRunBytes::Stop,
+                    b']' => {
+                        self.content_bracket_run += 1;
+                        self.pos += 1;
+                    }
+                    b'>' => {
+                        if self.content_bracket_run >= 2 {
+                            return ContentRunBytes::Illegal;
+                        }
+                        self.content_bracket_run = 0;
+                        self.pos += 1;
+                    }
+                    _ => {
+                        self.content_bracket_run = 0;
+                        self.pos += 1;
+                    }
+                }
+                continue;
+            }
+            if b < 0x80 {
+                // Non-printable ASCII (controls, DEL): still one byte, no
+                // decode needed, but does need the real legality check
+                // (most of this range is illegal outright in content).
+                let c = b as char;
+                if !self.is_legal_literal_char(c) {
+                    if self.allow_restricted_char_in_content
+                        && self.xml11
+                        && is_restricted_char_xml11(c)
+                    {
+                        self.content_bracket_run = 0;
+                        self.pos += 1;
+                        continue;
+                    }
+                    return ContentRunBytes::Illegal;
+                }
+                self.content_bracket_run = 0;
+                self.pos += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return ContentRunBytes::Illegal;
+            }
+            if self.pos + seq_len > self.limit {
+                return ContentRunBytes::NeedMore;
+            }
+            let slice = &self.buf.as_bytes()[self.pos..self.pos + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return ContentRunBytes::Illegal,
+            };
+            if !self.is_legal_literal_char(c) {
+                if self.allow_restricted_char_in_content && self.xml11 && is_restricted_char_xml11(c)
+                {
+                    self.content_bracket_run = 0;
+                    self.pos += seq_len;
+                    continue;
+                }
+                return ContentRunBytes::Illegal;
+            }
+            self.content_bracket_run = 0;
+            self.pos += seq_len;
+        }
+    }
+
     fn check_name_start_char(&mut self, name_start: usize) -> ParseResult<()> {
         if !is_name_start_char(self.buf[name_start]) {
             return Err(self.fatal("Names must begin with a legal NameStartChar"));
         }
         Ok(())
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `check_name_start_char`. Decodes just the one (possibly multi-byte)
+    /// character at `name_start` — safe to `unwrap`, since every caller
+    /// only reaches this after its own scan loop has already walked past
+    /// `name_start` without erroring, which is only possible if that byte
+    /// begins a well-formed sequence.
+    #[allow(dead_code)]
+    fn check_name_start_char_bytes(&mut self, name_start: usize) -> ParseResult<()> {
+        let b = self.buf.as_bytes()[name_start];
+        let c = if b < 0x80 {
+            b as char
+        } else {
+            let seq_len = utf8_seq_len(b);
+            let slice = &self.buf.as_bytes()[name_start..name_start + seq_len];
+            std::str::from_utf8(slice).unwrap().chars().next().unwrap()
+        };
+        if !is_name_start_char(c) {
+            return Err(self.fatal("Names must begin with a legal NameStartChar"));
+        }
+        Ok(())
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to the
+    /// `while p < self.limit && is_name_char(self.buf[p]) { p += 1; }` loop
+    /// repeated across `scan_start_tag`/`scan_attributes_and_tag_end`/
+    /// `scan_end_tag`. ASCII NameChars are checked directly; the rare
+    /// non-ASCII NameChar is decoded on demand, same pattern as
+    /// `decode_entity_ref_bytes`'s name loop. Unlike content/attribute-value
+    /// scanning, hitting invalid UTF-8 here is unconditionally a malformed
+    /// document (there's no legal way for a NameChar run to contain
+    /// ill-formed bytes), so callers turn `Illegal` into a fatal error with
+    /// their own context-specific message.
+    #[allow(dead_code)]
+    fn scan_name_chars_bytes(&mut self, start: usize) -> NameScanBytes {
+        let mut p = start;
+        loop {
+            if p >= self.limit {
+                return NameScanBytes::NeedMore;
+            }
+            let b = self.buf.as_bytes()[p];
+            if b < 0x80 {
+                if !is_name_char(b as char) {
+                    return NameScanBytes::End(p);
+                }
+                p += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return NameScanBytes::Illegal;
+            }
+            if p + seq_len > self.limit {
+                return NameScanBytes::NeedMore;
+            }
+            let slice = &self.buf.as_bytes()[p..p + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return NameScanBytes::Illegal,
+            };
+            if !is_name_char(c) {
+                return NameScanBytes::End(p);
+            }
+            p += seq_len;
+        }
     }
 
     fn range_equals(&self, start: usize, len: usize, s: &str) -> bool {
@@ -1063,6 +1516,73 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan` — the top-level dispatch loop, tying together every
+    /// byte-native scanner built across this whole exploration. Faithfully
+    /// mirrors `scan`'s resumption structure, including its one quirk:
+    /// `in_doctype` resumption always goes through `scan_doctype_subset_bytes`
+    /// regardless of `DoctypeHandling::Skip` vs `Process`, exactly like the
+    /// char path — not something this port introduces or fixes.
+    #[allow(dead_code)]
+    fn scan_bytes(&mut self) -> ParseResult<()> {
+        loop {
+            if self.in_pi {
+                if !self.scan_pi_data_bytes()? {
+                    return Ok(());
+                }
+                self.in_pi = false;
+                continue;
+            }
+            if self.in_comment {
+                if !self.scan_comment_data_bytes()? {
+                    return Ok(());
+                }
+                self.in_comment = false;
+                continue;
+            }
+            if self.in_cdata {
+                if !self.scan_cdata_content_bytes()? {
+                    return Ok(());
+                }
+                self.in_cdata = false;
+                continue;
+            }
+            if self.in_attribute_value {
+                let quote = self.pending_quote as u8;
+                match self.scan_attribute_value_streaming_bytes(quote)? {
+                    AttrValueScanBytes::NeedMore => return Ok(()),
+                    AttrValueScanBytes::Done => {}
+                }
+                self.in_attribute_value = false;
+                continue;
+            }
+            if self.in_start_tag {
+                if !self.scan_attributes_and_tag_end_bytes()? {
+                    return Ok(());
+                }
+                self.in_start_tag = false;
+                continue;
+            }
+            if self.in_doctype {
+                if !self.scan_doctype_subset_bytes()? {
+                    return Ok(());
+                }
+                self.in_doctype = false;
+                continue;
+            }
+            if self.pos >= self.limit {
+                return Ok(());
+            }
+            if self.buf.as_bytes()[self.pos] == b'<' {
+                if !self.scan_markup_bytes()? {
+                    return Ok(());
+                }
+            } else if !self.scan_content_bytes()? {
+                return Ok(());
+            }
+        }
+    }
+
     // ===== Content =====
 
     fn is_current_element_content_element_only(&self) -> bool {
@@ -1087,6 +1607,19 @@ impl<'a> Scanner<'a> {
             self.record_text_for_validation(s, is_ws)?;
         }
         self.handler.characters(s, is_ws, end)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `emit_content_run`. Reuses `emit_content_run_str` unchanged.
+    #[allow(dead_code)]
+    fn emit_content_run_bytes(
+        &mut self,
+        start: usize,
+        end_idx: usize,
+        end: bool,
+        is_ws: bool,
+    ) -> ParseResult<()> {
+        self.slice_and_bytes(start, end_idx, |this, s| this.emit_content_run_str(s, end, is_ws))
     }
 
     fn emit_content_empty(&mut self, end: bool, is_ws: bool) -> ParseResult<()> {
@@ -1222,6 +1755,228 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_content` — the full content orchestration built on top of
+    /// `scan_content_run_bytes` (the earlier, leaf-only exploratory
+    /// primitive). The element-only-content whitespace-boundary loop
+    /// decodes ASCII directly and treats any non-ASCII byte as
+    /// automatically non-whitespace (no XML `S` character is ever
+    /// multi-byte), so it only needs to decode a full codepoint when it's
+    /// already committed to including it in the current run.
+    /// `scan_content_run_bytes`'s `Illegal` outcome doesn't distinguish
+    /// "bad character" from "']]>' outside CDATA" (unlike the char path's
+    /// two distinct error returns), so this reconstructs which one
+    /// happened from `self.content_bracket_run` before producing the
+    /// matching message.
+    #[allow(dead_code)]
+    fn scan_content_bytes(&mut self) -> ParseResult<bool> {
+        let inside_document = !self.element_stack.is_empty();
+        let element_only_content = inside_document && self.is_current_element_content_element_only();
+        loop {
+            let run_start = self.pos;
+            // Set when the scan below stopped specifically because a
+            // trailing multi-byte sequence isn't fully buffered yet —
+            // distinct from `self.pos >= self.limit` (which only covers
+            // "ran off the end with nothing left at all"). Without this,
+            // that case falls through to the `self.buf[self.pos] != '&'`
+            // branch below (the lead byte is neither `<` nor `&`), which
+            // `continue`s the outer loop straight back into the same
+            // truncated sequence forever — an infinite loop that only
+            // shows up on real multi-byte content split exactly at a
+            // chunk boundary, which is exactly why xmlconf's single-shot
+            // `parse_all` calls never caught it.
+            let mut needs_more_bytes = false;
+            if element_only_content
+                && self.pos < self.limit
+                && self.buf.as_bytes()[self.pos] != b'<'
+                && self.buf.as_bytes()[self.pos] != b'&'
+            {
+                let b0 = self.buf.as_bytes()[self.pos];
+                let ws0 = b0 < 0x80 && is_ws(b0 as char);
+                loop {
+                    if self.pos >= self.limit {
+                        break;
+                    }
+                    let b = self.buf.as_bytes()[self.pos];
+                    if b == b'<' || b == b'&' {
+                        break;
+                    }
+                    if b < 0x80 {
+                        let c = b as char;
+                        if is_ws(c) != ws0 {
+                            break;
+                        }
+                        self.check_content_char(c)?;
+                        self.pos += 1;
+                        continue;
+                    }
+                    // No multi-byte codepoint is XML whitespace, so a
+                    // whitespace run can never include one.
+                    if ws0 {
+                        break;
+                    }
+                    let seq_len = utf8_seq_len(b);
+                    if seq_len == 0 {
+                        return Err(self.fatal("Ill-formed UTF-8 sequence"));
+                    }
+                    if self.pos + seq_len > self.limit {
+                        needs_more_bytes = true;
+                        break;
+                    }
+                    let slice = &self.buf.as_bytes()[self.pos..self.pos + seq_len];
+                    let c = match std::str::from_utf8(slice) {
+                        Ok(s) => s.chars().next().unwrap(),
+                        Err(_) => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+                    };
+                    self.check_content_char(c)?;
+                    self.pos += seq_len;
+                }
+            } else {
+                match self.scan_content_run_bytes() {
+                    ContentRunBytes::Stop => {}
+                    ContentRunBytes::NeedMore => {
+                        needs_more_bytes = true;
+                    }
+                    ContentRunBytes::Illegal => {
+                        if self.buf.as_bytes()[self.pos] == b'>' && self.content_bracket_run >= 2 {
+                            return Err(self.fatal(
+                                "\"]]>\" is not allowed in content, except to mark the end of a CDATA section",
+                            ));
+                        }
+                        let b = self.buf.as_bytes()[self.pos];
+                        if b < 0x80 {
+                            return Err(self.illegal_char_error(b as char));
+                        }
+                        // `Illegal` also covers genuinely malformed UTF-8
+                        // (invalid lead byte, bad continuation bytes) --
+                        // not just a validly-decoded-but-XML-disallowed
+                        // character -- so decoding here can legitimately
+                        // fail; that case gets its own message rather than
+                        // forcing a char out of bytes that aren't one.
+                        let seq_len = utf8_seq_len(b);
+                        if seq_len == 0 || self.pos + seq_len > self.limit {
+                            return Err(self.fatal("Ill-formed UTF-8 sequence"));
+                        }
+                        let slice = &self.buf.as_bytes()[self.pos..self.pos + seq_len];
+                        let c = match std::str::from_utf8(slice) {
+                            Ok(s) => match s.chars().next() {
+                                Some(c) => c,
+                                None => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+                            },
+                            Err(_) => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+                        };
+                        return Err(self.illegal_char_error(c));
+                    }
+                }
+            }
+            let run_is_whitespace = element_only_content && self.pos > run_start && {
+                let b = self.buf.as_bytes()[run_start];
+                b < 0x80 && is_ws(b as char)
+            };
+            if run_is_whitespace
+                && self.standalone
+                && self.validation_enabled
+                && self.is_current_element_declared_externally()
+            {
+                let current = self.element_stack.last().unwrap().clone();
+                let msg = format!(
+                    "Validity Constraint: Standalone Document Declaration (Section 2.9). Document has standalone=\"yes\" but external DTD subset declares element \"{current}\" with element-only content, and white space occurs directly within its content."
+                );
+                self.handler.error(&msg)?;
+            }
+            if !inside_document && self.pos > run_start {
+                for i in run_start..self.pos {
+                    let b = self.buf.as_bytes()[i];
+                    let is_ws_byte = b < 0x80 && is_ws(b as char);
+                    if !is_ws_byte {
+                        let where_ = if self.root_ended {
+                            "after the root element"
+                        } else {
+                            "before the root element"
+                        };
+                        let msg = format!(
+                            "Only whitespace, comments, and processing instructions are allowed {where_}"
+                        );
+                        return Err(self.fatal(&msg));
+                    }
+                }
+            }
+            if self.pos >= self.limit || needs_more_bytes {
+                if inside_document && self.pos > run_start {
+                    self.emit_content_run_bytes(run_start, self.pos, false, run_is_whitespace)?;
+                    self.content_run_open = true;
+                    self.content_run_is_whitespace = run_is_whitespace;
+                }
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[self.pos] == b'<' {
+                if inside_document {
+                    if self.pos > run_start {
+                        self.emit_content_run_bytes(run_start, self.pos, true, run_is_whitespace)?;
+                        self.content_run_open = false;
+                    } else if self.content_run_open {
+                        let ws = self.content_run_is_whitespace;
+                        self.emit_content_empty(true, ws)?;
+                        self.content_run_open = false;
+                    }
+                }
+                self.content_bracket_run = 0;
+                return Ok(true);
+            }
+            if self.buf.as_bytes()[self.pos] != b'&' {
+                if inside_document && self.pos > run_start {
+                    self.emit_content_run_bytes(run_start, self.pos, true, run_is_whitespace)?;
+                    self.content_run_open = false;
+                }
+                continue;
+            }
+            if !inside_document {
+                return Err(self.fatal(
+                    "Entity and character references are only allowed within the document element",
+                ));
+            }
+            let amp_pos = self.pos;
+            if inside_document && amp_pos > run_start {
+                self.emit_content_run_bytes(run_start, amp_pos, false, run_is_whitespace)?;
+                self.content_run_open = true;
+                self.content_run_is_whitespace = run_is_whitespace;
+            }
+            match self.decode_entity_ref_bytes()? {
+                RefResult::NeedMore => {
+                    self.pos = amp_pos;
+                    return Ok(false);
+                }
+                RefResult::General(name) => {
+                    if inside_document && self.content_run_open {
+                        let ws = self.content_run_is_whitespace;
+                        self.emit_content_empty(true, ws)?;
+                    }
+                    self.content_run_open = false;
+                    self.content_bracket_run = 0;
+                    self.check_not_empty_element_content("an entity reference")?;
+                    self.expand_general_entity_in_content_bytes(&name)?;
+                    continue;
+                }
+                RefResult::Decoded(decoded) => {
+                    self.content_bracket_run = 0;
+                    let at_markup =
+                        self.pos < self.limit && self.buf.as_bytes()[self.pos] == b'<';
+                    if inside_document {
+                        if self.validation_enabled {
+                            self.record_text_for_validation(&decoded, false)?;
+                        }
+                        self.handler.characters(&decoded, false, at_markup)?;
+                        self.content_run_open = !at_markup;
+                        self.content_run_is_whitespace = false;
+                    }
+                    if at_markup {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
     // ===== Entity reference decoding =====
 
     fn decode_entity_ref(&mut self) -> ParseResult<RefResult> {
@@ -1282,11 +2037,122 @@ impl<'a> Scanner<'a> {
         }
         self.check_name_start_char(name_start)?;
         let len = p - name_start;
-        if let Some(predef) = match_predefined(&self.buf, name_start, len) {
+        if let Some(predef) = match_predefined(self.buf.as_chars(), name_start, len) {
             self.pos = p + 1;
             return Ok(RefResult::Decoded(predef.to_string()));
         }
         let name: String = self.buf[name_start..p].iter().collect();
+        self.pos = p + 1;
+        Ok(RefResult::General(name))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `decode_entity_ref`. Reuses the same `RefResult` the char path
+    /// returns -- it's just an owned `String`/name, built fresh regardless
+    /// of which path produced it, so nothing downstream needs to change.
+    /// Numeric character references never involve multi-byte decoding
+    /// (digits, 'x', and ';' are all ASCII by definition); named references
+    /// can, so that scan reuses the same NeedMore-on-split-sequence handling
+    /// as the other byte-native scanners.
+    #[allow(dead_code)]
+    fn decode_entity_ref_bytes(&mut self) -> ParseResult<RefResult> {
+        let mut p = self.pos + 1;
+        if p >= self.limit {
+            return Ok(RefResult::NeedMore);
+        }
+        if self.buf.as_bytes()[p] == b'#' {
+            p += 1;
+            let mut hex = false;
+            if p < self.limit && self.buf.as_bytes()[p] == b'x' {
+                hex = true;
+                p += 1;
+            }
+            let digits_start = p;
+            while p < self.limit && self.buf.as_bytes()[p] != b';' {
+                let d = self.buf.as_bytes()[p];
+                let ok = if hex {
+                    d.is_ascii_hexdigit()
+                } else {
+                    d.is_ascii_digit()
+                };
+                if !ok {
+                    return Err(self.fatal("Malformed character reference"));
+                }
+                p += 1;
+            }
+            if p >= self.limit {
+                return Ok(RefResult::NeedMore);
+            }
+            if p == digits_start {
+                return Err(self.fatal("Empty character reference"));
+            }
+            // SAFETY: every byte in [digits_start, p) was just checked to be
+            // an ASCII hex/decimal digit.
+            let digits =
+                unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[digits_start..p]) };
+            let code_point = match u32::from_str_radix(digits, if hex { 16 } else { 10 }) {
+                Ok(v) => v,
+                Err(_) => return Err(self.fatal("Malformed character reference")),
+            };
+            if !is_legal_char_ref_code_point(code_point, self.xml11) {
+                let msg = format!("Character reference out of range: {code_point}");
+                return Err(self.fatal(&msg));
+            }
+            self.pos = p + 1;
+            let ch = char::from_u32(code_point)
+                .ok_or_else(|| ParseError::new("Character reference out of range"))?;
+            return Ok(RefResult::Decoded(ch.to_string()));
+        }
+
+        let name_start = p;
+        loop {
+            if p >= self.limit {
+                return Ok(RefResult::NeedMore);
+            }
+            let b = self.buf.as_bytes()[p];
+            if b == b';' {
+                break;
+            }
+            if b < 0x80 {
+                if !is_name_char(b as char) {
+                    break;
+                }
+                p += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return Err(self.fatal("Malformed entity reference"));
+            }
+            if p + seq_len > self.limit {
+                return Ok(RefResult::NeedMore);
+            }
+            let slice = &self.buf.as_bytes()[p..p + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return Err(self.fatal("Malformed entity reference")),
+            };
+            if !is_name_char(c) {
+                break;
+            }
+            p += seq_len;
+        }
+        if p >= self.limit {
+            return Ok(RefResult::NeedMore);
+        }
+        if p == name_start || self.buf.as_bytes()[p] != b';' {
+            return Err(self.fatal("Malformed entity reference"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name_bytes = &self.buf.as_bytes()[name_start..p];
+        if let Some(predef) = match_predefined_bytes(name_bytes) {
+            self.pos = p + 1;
+            return Ok(RefResult::Decoded(predef.to_string()));
+        }
+        // SAFETY: every byte in this range was validated as part of a legal
+        // XML Name above (ASCII checked directly; non-ASCII decoded and
+        // checked via is_name_char).
+        let name = unsafe { std::str::from_utf8_unchecked(name_bytes) }.to_string();
         self.pos = p + 1;
         Ok(RefResult::General(name))
     }
@@ -1315,6 +2181,34 @@ impl<'a> Scanner<'a> {
             self.scan_pi(tag_start)
         } else {
             self.scan_start_tag(tag_start)
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_markup`.
+    #[allow(dead_code)]
+    fn scan_markup_bytes(&mut self) -> ParseResult<bool> {
+        let tag_start = self.pos;
+        let p = tag_start + 1;
+        if p >= self.limit {
+            return Ok(false);
+        }
+        let c = self.buf.as_bytes()[p];
+        if c == b'/' {
+            self.scan_end_tag_bytes(tag_start)
+        } else if c == b'!' {
+            if p + 1 >= self.limit {
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[p + 1] == b'-' {
+                self.check_not_empty_element_content("a comment")?;
+            }
+            self.scan_bang_markup_bytes(tag_start)
+        } else if c == b'?' {
+            self.check_not_empty_element_content("a processing instruction")?;
+            self.scan_pi_bytes(tag_start)
+        } else {
+            self.scan_start_tag_bytes(tag_start)
         }
     }
 
@@ -1350,7 +2244,61 @@ impl<'a> Scanner<'a> {
         if self.root_ended {
             return Err(self.fatal("A document may contain only one root element"));
         }
-        let q_name = self.name_pool.intern_range(&self.buf, name_start, p - name_start);
+        let q_name = self.name_pool.intern_range(self.buf.as_chars(), name_start, p - name_start);
+        if !self.root_started {
+            self.root_started = true;
+            if self.validation_enabled {
+                if let Some(dname) = self.doctype_name.clone() {
+                    if dname != *q_name {
+                        let msg = format!(
+                            "Validity Constraint: Root Element Type (Section 3.2). Document root element \"{q_name}\" does not match DOCTYPE name \"{dname}\"."
+                        );
+                        self.handler.error(&msg)?;
+                    }
+                }
+            }
+        }
+        if self.validation_enabled {
+            self.push_element_validator(&q_name)?;
+        }
+        self.pos = p;
+        self.element_stack.push(q_name.clone());
+        self.seen_attribute_names.clear();
+        self.handler.start_element(&q_name)?;
+        self.in_start_tag = true;
+        Ok(true)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_start_tag`. Interning uses `name_pool.intern_str` directly on
+    /// a decoded `&str` view of the name range rather than a byte-native
+    /// `intern_range` — `intern_str` already exists and takes exactly that,
+    /// so no port was needed there either (same shape of discovery as
+    /// `emit_attribute_value_content` and `expand_general_entity_in_attribute_value`).
+    #[allow(dead_code)]
+    fn scan_start_tag_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        let name_start = tag_start + 1;
+        let p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed start tag")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed start tag"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        if self.root_ended {
+            return Err(self.fatal("A document may contain only one root element"));
+        }
+        // SAFETY: [name_start, p) was validated as a legal XML Name by
+        // scan_name_chars_bytes above (ASCII checked directly; non-ASCII
+        // decoded and checked via is_name_char).
+        let name_str =
+            unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[name_start..p]) };
+        let q_name = self.name_pool.intern_str(name_str);
         if !self.root_started {
             self.root_started = true;
             if self.validation_enabled {
@@ -1434,7 +2382,7 @@ impl<'a> Scanner<'a> {
             self.check_name_start_char(name_start)?;
             let attr_name = self
                 .name_pool
-                .intern_range(&self.buf, name_start, self.pos - name_start);
+                .intern_range(self.buf.as_chars(), name_start, self.pos - name_start);
 
             while self.pos < self.limit && is_ws(self.buf[self.pos]) {
                 self.pos += 1;
@@ -1510,6 +2458,154 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_attributes_and_tag_end`. Whitespace/`>`/`/`/`=`/quote checks
+    /// compare raw bytes directly (all of `is_ws`'s and the structural
+    /// characters here are ASCII, so no byte in a multi-byte sequence's
+    /// lead/continuation range can ever match them — no decode needed).
+    /// Attribute-name interning again goes through `intern_str` on a
+    /// decoded `&str`, same as `scan_start_tag_bytes`.
+    #[allow(dead_code)]
+    fn scan_attributes_and_tag_end_bytes(&mut self) -> ParseResult<bool> {
+        let current_element_name = self.element_stack.last().unwrap().clone();
+        let declared_attrs: Option<Vec<(String, crate::dtd::AttDef)>> = self
+            .dtd_model
+            .get_attributes(&current_element_name)
+            .cloned();
+        loop {
+            let attr_start = self.pos;
+            while self.pos < self.limit && is_ws(self.buf.as_bytes()[self.pos] as char) {
+                self.pos += 1;
+            }
+            if self.pos >= self.limit {
+                self.pos = attr_start;
+                return Ok(false);
+            }
+            let b = self.buf.as_bytes()[self.pos];
+            if self.pos == attr_start && b < 0x80 && is_name_char(b as char) {
+                return Err(self.fatal("White space is required between attributes"));
+            }
+            if b == b'>' {
+                self.pos += 1;
+                self.apply_attribute_defaults(&current_element_name)?;
+                self.handler.end_attributes()?;
+                return Ok(true);
+            }
+            if b == b'/' {
+                if self.pos + 1 >= self.limit {
+                    self.pos = attr_start;
+                    return Ok(false);
+                }
+                if self.buf.as_bytes()[self.pos + 1] != b'>' {
+                    return Err(self.fatal("Malformed start tag"));
+                }
+                self.pos += 2;
+                self.apply_attribute_defaults(&current_element_name)?;
+                if self.validation_enabled {
+                    self.pop_and_validate_element()?;
+                }
+                self.element_stack.pop();
+                self.root_ended = self.element_stack.is_empty();
+                self.handler.end_attributes()?;
+                self.handler.end_element()?;
+                return Ok(true);
+            }
+
+            let name_start = self.pos;
+            let name_end = match self.scan_name_chars_bytes(name_start) {
+                NameScanBytes::NeedMore => {
+                    self.pos = attr_start;
+                    return Ok(false);
+                }
+                NameScanBytes::Illegal => return Err(self.fatal("Malformed start tag")),
+                NameScanBytes::End(p) => p,
+            };
+            if name_end == name_start {
+                return Err(self.fatal("Malformed start tag"));
+            }
+            self.check_name_start_char_bytes(name_start)?;
+            // SAFETY: [name_start, name_end) was validated as a legal XML
+            // Name by scan_name_chars_bytes above.
+            let attr_name_str = unsafe {
+                std::str::from_utf8_unchecked(&self.buf.as_bytes()[name_start..name_end])
+            };
+            let attr_name = self.name_pool.intern_str(attr_name_str);
+            self.pos = name_end;
+
+            while self.pos < self.limit && is_ws(self.buf.as_bytes()[self.pos] as char) {
+                self.pos += 1;
+            }
+            if self.pos >= self.limit {
+                self.pos = attr_start;
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[self.pos] != b'=' {
+                return Err(self.fatal("Expected '=' after attribute name"));
+            }
+            self.pos += 1;
+
+            while self.pos < self.limit && is_ws(self.buf.as_bytes()[self.pos] as char) {
+                self.pos += 1;
+            }
+            if self.pos >= self.limit {
+                self.pos = attr_start;
+                return Ok(false);
+            }
+            let quote = self.buf.as_bytes()[self.pos];
+            if quote != b'"' && quote != b'\'' {
+                return Err(self.fatal("Expected quoted attribute value"));
+            }
+            self.pos += 1;
+
+            // Check for duplicate after all backtrack points have passed.
+            self.record_seen_attribute_name(attr_name.clone())?;
+
+            let attr_def = declared_attrs
+                .as_ref()
+                .and_then(|attrs| attrs.iter().find(|(n, _)| n.as_str() == attr_name.as_ref()).map(|(_, d)| d));
+            let attr_type = attr_def.map(|d| d.attr_type.clone()).unwrap_or_else(|| "CDATA".to_string());
+            if self.validation_enabled && attr_def.is_none() {
+                let msg = format!(
+                    "Validity Constraint: Attribute Value Type (Section 3.3.1). Attribute \"{attr_name}\" is not declared for element \"{current_element_name}\"."
+                );
+                self.handler.error(&msg)?;
+            }
+            let declared = attr_def.is_some();
+            let declared_externally = attr_def.map(|d| d.declared_externally).unwrap_or(false);
+            self.handler
+                .start_attribute(&attr_name, &attr_type, declared, true)?;
+            self.pending_quote = quote as char;
+            self.attr_value_run_open = false;
+            self.collapse_current_attr_value = attr_type != "CDATA";
+            let check_xml_space = attr_name.as_ref() == "xml:space";
+            self.normalizing_current_attribute =
+                self.collapse_current_attr_value || self.validation_enabled || check_xml_space;
+            if self.normalizing_current_attribute {
+                self.normalize_builder.clear();
+                if self.validation_enabled || check_xml_space {
+                    self.current_attr_element_name = current_element_name.to_string();
+                    self.current_attr_name = attr_name.to_string();
+                    self.current_attr_type = attr_type.clone();
+                }
+                if self.validation_enabled
+                    && self.standalone
+                    && self.collapse_current_attr_value
+                    && declared
+                    && declared_externally
+                {
+                    let msg = format!(
+                        "Validity Constraint: Standalone Document Declaration (Section 2.9). Document has standalone=\"yes\" but external markup declares attribute \"{attr_name}\" of element \"{current_element_name}\" with type \"{attr_type}\", which normalizes this specified value differently."
+                    );
+                    self.handler.error(&msg)?;
+                }
+            }
+            if self.scan_attribute_value_streaming_bytes(quote)? == AttrValueScanBytes::NeedMore {
+                self.in_attribute_value = true;
+                return Ok(false);
+            }
+        }
+    }
+
     fn is_attr_stop(&self, c: char, quote: char) -> bool {
         // See is_content_stop: printable ASCII is always legal, so the
         // three real stop characters are a complete answer without
@@ -1524,6 +2620,135 @@ impl<'a> Scanner<'a> {
             || c == '\n'
             || c == '\r'
             || !self.is_legal_literal_char(c)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `is_attr_stop`'s scanning loop inside `scan_attribute_value_streaming`
+    /// — the position-finding and in-place tab/newline/CR-to-space
+    /// normalization only, not yet the handler emission or entity-reference
+    /// decoding wired around it in the real function (that needs
+    /// `emit_attribute_value_content`/`decode_entity_ref` to grow their own
+    /// byte-native forms first, a separate later step). Same NeedMore
+    /// distinction as `scan_content_run_bytes`, for the same reason: a
+    /// chunk boundary can split a multi-byte sequence here too.
+    #[allow(dead_code)]
+    fn scan_attr_value_run_bytes(&mut self, quote: u8) -> AttrValueRunBytes {
+        loop {
+            if self.pos >= self.limit {
+                return AttrValueRunBytes::NeedMore;
+            }
+            let b = self.buf.as_bytes()[self.pos];
+            if (0x20..=0x7E).contains(&b) {
+                if b == quote {
+                    return AttrValueRunBytes::Quote;
+                }
+                if b == b'&' {
+                    return AttrValueRunBytes::Amp;
+                }
+                if b == b'<' {
+                    return AttrValueRunBytes::Illegal;
+                }
+                self.pos += 1;
+                continue;
+            }
+            if b == b'\t' || b == b'\n' || b == b'\r' {
+                self.buf.as_bytes_mut()[self.pos] = b' ';
+                self.pos += 1;
+                continue;
+            }
+            if b < 0x80 {
+                let c = b as char;
+                if !self.is_legal_literal_char(c) {
+                    return AttrValueRunBytes::Illegal;
+                }
+                self.pos += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return AttrValueRunBytes::Illegal;
+            }
+            if self.pos + seq_len > self.limit {
+                return AttrValueRunBytes::NeedMore;
+            }
+            let slice = &self.buf.as_bytes()[self.pos..self.pos + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return AttrValueRunBytes::Illegal,
+            };
+            if !self.is_legal_literal_char(c) {
+                return AttrValueRunBytes::Illegal;
+            }
+            self.pos += seq_len;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_attribute_value_streaming`, now handling entity/character
+    /// references inline (mirroring the char path's loop) rather than
+    /// stopping at `&`. Calls the real, representation-agnostic
+    /// `emit_attribute_value_content` (via `slice_and_bytes` for ordinary
+    /// runs, directly for decoded reference text) and
+    /// `expand_general_entity_in_attribute_value` — both already operate
+    /// purely on `&str`/entity tables and never touch `self.buf`, so
+    /// neither needed a byte-native port at all.
+    #[allow(dead_code)]
+    fn scan_attribute_value_streaming_bytes(
+        &mut self,
+        quote: u8,
+    ) -> ParseResult<AttrValueScanBytes> {
+        loop {
+            let run_start = self.pos;
+            match self.scan_attr_value_run_bytes(quote) {
+                AttrValueRunBytes::NeedMore => {
+                    if self.pos > run_start {
+                        self.slice_and_bytes(run_start, self.pos, |this, s| {
+                            this.emit_attribute_value_content(s, false)
+                        })?;
+                    }
+                    return Ok(AttrValueScanBytes::NeedMore);
+                }
+                AttrValueRunBytes::Illegal => {
+                    return Err(self.fatal("Illegal character or '<' in attribute value"));
+                }
+                AttrValueRunBytes::Quote => {
+                    if self.pos > run_start {
+                        self.slice_and_bytes(run_start, self.pos, |this, s| {
+                            this.emit_attribute_value_content(s, true)
+                        })?;
+                    } else {
+                        self.emit_attribute_value_content("", true)?;
+                    }
+                    self.pos += 1;
+                    return Ok(AttrValueScanBytes::Done);
+                }
+                AttrValueRunBytes::Amp => {
+                    let amp_pos = self.pos;
+                    if amp_pos > run_start {
+                        self.slice_and_bytes(run_start, amp_pos, |this, s| {
+                            this.emit_attribute_value_content(s, false)
+                        })?;
+                    }
+                    let decoded = match self.decode_entity_ref_bytes()? {
+                        RefResult::NeedMore => {
+                            self.pos = amp_pos;
+                            return Ok(AttrValueScanBytes::NeedMore);
+                        }
+                        RefResult::General(name) => {
+                            self.expand_general_entity_in_attribute_value(&name)?
+                        }
+                        RefResult::Decoded(s) => s,
+                    };
+                    let at_quote =
+                        self.pos < self.limit && self.buf.as_bytes()[self.pos] == quote;
+                    self.emit_attribute_value_content(&decoded, at_quote)?;
+                    if at_quote {
+                        self.pos += 1;
+                        return Ok(AttrValueScanBytes::Done);
+                    }
+                }
+            }
+        }
     }
 
     fn scan_attribute_value_streaming(&mut self) -> ParseResult<bool> {
@@ -1709,6 +2934,102 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_end_tag`. The fast-path re-check compares raw byte slices
+    /// directly rather than going through a `range_equals`-style helper —
+    /// slice `!=` already accounts for a length mismatch (unlike the char
+    /// path, which has to compare `expected.chars().count()` against a
+    /// char-position span before it can compare content), so no
+    /// byte-native `range_equals` port was needed either.
+    #[allow(dead_code)]
+    fn scan_end_tag_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        let name_start = tag_start + 2;
+        let stack_size = self.element_stack.len();
+        if stack_size > 0 {
+            let expected = self.element_stack[stack_size - 1].clone();
+            let expected_bytes = expected.as_bytes();
+            let after_name = name_start + expected_bytes.len();
+            if after_name < self.limit
+                && self.buf.as_bytes()[after_name] == b'>'
+                && &self.buf.as_bytes()[name_start..after_name] == expected_bytes
+                && (self.entity_stack_floors.is_empty()
+                    || stack_size > *self.entity_stack_floors.last().unwrap())
+            {
+                self.element_stack.pop();
+                if self.validation_enabled {
+                    self.pop_and_validate_element()?;
+                }
+                self.root_ended = self.element_stack.is_empty();
+                self.pos = after_name + 1;
+                self.handler.end_element()?;
+                return Ok(true);
+            }
+        }
+        let name_end = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed end tag")),
+            NameScanBytes::End(p) => p,
+        };
+        if name_end == name_start {
+            return Err(self.fatal("Malformed end tag"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let mut p = name_end;
+        while p < self.limit && is_ws(self.buf.as_bytes()[p] as char) {
+            p += 1;
+        }
+        if p >= self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        if self.buf.as_bytes()[p] != b'>' {
+            return Err(self.fatal("Malformed end tag"));
+        }
+        p += 1;
+
+        if self.element_stack.is_empty() {
+            // SAFETY: [name_start, name_end) was validated as a legal XML
+            // Name above.
+            let found = unsafe {
+                std::str::from_utf8_unchecked(&self.buf.as_bytes()[name_start..name_end])
+            }
+            .to_string();
+            let msg = format!("End tag without matching start tag: {found}");
+            return Err(self.fatal(&msg));
+        }
+        if !self.entity_stack_floors.is_empty()
+            && self.element_stack.len() <= *self.entity_stack_floors.last().unwrap()
+        {
+            let found = unsafe {
+                std::str::from_utf8_unchecked(&self.buf.as_bytes()[name_start..name_end])
+            }
+            .to_string();
+            let msg = format!(
+                "End tag </{found}> in an entity's replacement text must not close an element that was opened outside that entity (element boundaries must nest within entity boundaries)"
+            );
+            return Err(self.fatal(&msg));
+        }
+        let expected = self.element_stack.pop().unwrap();
+        if &self.buf.as_bytes()[name_start..name_end] != expected.as_bytes() {
+            let found = unsafe {
+                std::str::from_utf8_unchecked(&self.buf.as_bytes()[name_start..name_end])
+            }
+            .to_string();
+            let msg = format!("Mismatched end tag: expected </{expected}> but found </{found}>");
+            return Err(self.fatal(&msg));
+        }
+        if self.validation_enabled {
+            self.pop_and_validate_element()?;
+        }
+        self.root_ended = self.element_stack.is_empty();
+        self.pos = p;
+        self.handler.end_element()?;
+        Ok(true)
+    }
+
     // ===== Comment / CDATA / PI =====
 
     fn scan_bang_markup(&mut self, tag_start: usize) -> ParseResult<bool> {
@@ -1721,6 +3042,23 @@ impl<'a> Scanner<'a> {
             '-' => self.scan_comment(tag_start),
             '[' => self.scan_cdata(tag_start),
             'D' => self.scan_doctype(tag_start),
+            _ => Err(self.fatal("Malformed markup declaration")),
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_bang_markup`.
+    #[allow(dead_code)]
+    fn scan_bang_markup_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        let p = tag_start + 2;
+        if p >= self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        match self.buf.as_bytes()[p] {
+            b'-' => self.scan_comment_bytes(tag_start),
+            b'[' => self.scan_cdata_bytes(tag_start),
+            b'D' => self.scan_doctype_bytes(tag_start),
             _ => Err(self.fatal("Malformed markup declaration")),
         }
     }
@@ -1860,7 +3198,7 @@ impl<'a> Scanner<'a> {
             return Err(self.fatal("Malformed processing instruction"));
         }
         self.check_name_start_char(target_start)?;
-        let target = self.name_pool.intern_range(&self.buf, target_start, p - target_start);
+        let target = self.name_pool.intern_range(self.buf.as_chars(), target_start, p - target_start);
         let tchars: Vec<char> = target.chars().collect();
         if tchars.len() == 3
             && (tchars[0] == 'x' || tchars[0] == 'X')
@@ -1921,6 +3259,295 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to the
+    /// `while p < self.limit && self.buf[p] != stop { check legality; p += 1 }`
+    /// loop shared, in the char path, by `scan_comment_data`,
+    /// `scan_cdata_content`, and `scan_pi_data` (looking for `-`, `]`, and
+    /// `?` respectively — always ASCII, so no byte in a multi-byte
+    /// sequence can ever equal one). ASCII chars are legality-checked
+    /// directly; the rare non-ASCII char is decoded on demand, same
+    /// pattern as every other byte-native scanner here. Returns the
+    /// position reached either way, since callers need it to emit a
+    /// partial run before reporting `NeedMore`.
+    #[allow(dead_code)]
+    fn scan_until_byte_bytes(
+        &mut self,
+        start: usize,
+        stop_byte: u8,
+    ) -> ParseResult<LiteralUntilBytes> {
+        let mut p = start;
+        loop {
+            if p >= self.limit {
+                return Ok(LiteralUntilBytes::NeedMore(p));
+            }
+            let b = self.buf.as_bytes()[p];
+            if b == stop_byte {
+                return Ok(LiteralUntilBytes::Stop(p));
+            }
+            if b < 0x80 {
+                if !self.is_legal_literal_char(b as char) {
+                    return Err(self.illegal_char_error(b as char));
+                }
+                p += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return Err(self.fatal("Ill-formed UTF-8 sequence"));
+            }
+            if p + seq_len > self.limit {
+                return Ok(LiteralUntilBytes::NeedMore(p));
+            }
+            let slice = &self.buf.as_bytes()[p..p + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+            };
+            if !self.is_legal_literal_char(c) {
+                return Err(self.illegal_char_error(c));
+            }
+            p += seq_len;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_comment`.
+    #[allow(dead_code)]
+    fn scan_comment_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        if tag_start + 4 > self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        if self.buf.as_bytes()[tag_start + 3] != b'-' {
+            return Err(self.fatal("Malformed markup declaration"));
+        }
+        self.handler.start_comment()?;
+        self.pos = tag_start + 4;
+        if !self.scan_comment_data_bytes()? {
+            self.in_comment = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_comment_data`, built on `scan_until_byte_bytes`.
+    #[allow(dead_code)]
+    fn scan_comment_data_bytes(&mut self) -> ParseResult<bool> {
+        let mut p = self.pos;
+        loop {
+            p = match self.scan_until_byte_bytes(p, b'-')? {
+                LiteralUntilBytes::NeedMore(p) => {
+                    if p > self.pos {
+                        self.slice_and_bytes(self.pos, p, |this, s| {
+                            this.handler.comment_data(s, false)
+                        })?;
+                        self.pos = p;
+                    }
+                    return Ok(false);
+                }
+                LiteralUntilBytes::Stop(p) => p,
+            };
+            if p + 2 >= self.limit {
+                if p > self.pos {
+                    self.slice_and_bytes(self.pos, p, |this, s| {
+                        this.handler.comment_data(s, false)
+                    })?;
+                    self.pos = p;
+                }
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[p + 1] == b'-' {
+                if self.buf.as_bytes()[p + 2] == b'>' {
+                    self.slice_and_bytes(self.pos, p, |this, s| {
+                        this.handler.comment_data(s, true)
+                    })?;
+                    self.pos = p + 3;
+                    return Ok(true);
+                }
+                return Err(self.fatal("'--' is not allowed inside a comment"));
+            }
+            p += 1;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_cdata`. `CDATA_MARKER` is pure ASCII, so its bytes are
+    /// compared directly against `CDATA_MARKER.as_bytes()` instead of
+    /// going through a `Vec<char>` intermediate.
+    #[allow(dead_code)]
+    fn scan_cdata_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        let marker = CDATA_MARKER.as_bytes();
+        let match_len = marker.len().min(self.limit - tag_start);
+        for (i, &mb) in marker.iter().enumerate().take(match_len).skip(2) {
+            if self.buf.as_bytes()[tag_start + i] != mb {
+                return Err(self.fatal("Malformed markup declaration"));
+            }
+        }
+        if tag_start + marker.len() > self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        if self.element_stack.is_empty() {
+            return Err(self.fatal("CDATA sections are only allowed within the document element"));
+        }
+        self.handler.start_cdata()?;
+        self.pos = tag_start + marker.len();
+        self.cdata_run_open = false;
+        if !self.scan_cdata_content_bytes()? {
+            self.in_cdata = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_cdata_content`, built on `scan_until_byte_bytes`.
+    #[allow(dead_code)]
+    fn scan_cdata_content_bytes(&mut self) -> ParseResult<bool> {
+        let mut p = self.pos;
+        loop {
+            p = match self.scan_until_byte_bytes(p, b']')? {
+                LiteralUntilBytes::NeedMore(p) => {
+                    if p > self.pos {
+                        let start = self.pos;
+                        self.emit_cdata_chunk_bytes(start, p, false)?;
+                        self.cdata_run_open = true;
+                        self.pos = p;
+                    }
+                    return Ok(false);
+                }
+                LiteralUntilBytes::Stop(p) => p,
+            };
+            if p + 2 >= self.limit {
+                if p > self.pos {
+                    let start = self.pos;
+                    self.emit_cdata_chunk_bytes(start, p, false)?;
+                    self.cdata_run_open = true;
+                    self.pos = p;
+                }
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[p + 1] == b']' && self.buf.as_bytes()[p + 2] == b'>' {
+                if p > self.pos || self.cdata_run_open {
+                    let start = self.pos;
+                    self.emit_cdata_chunk_bytes(start, p, true)?;
+                }
+                self.cdata_run_open = false;
+                self.pos = p + 3;
+                self.handler.end_cdata()?;
+                return Ok(true);
+            }
+            p += 1;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `emit_cdata_chunk`. Reuses the existing, representation-agnostic
+    /// `emit_cdata_chunk_str` unchanged — it only ever touches the `&str`
+    /// it's handed, never `self.buf`.
+    #[allow(dead_code)]
+    fn emit_cdata_chunk_bytes(&mut self, start: usize, end: usize, is_end: bool) -> ParseResult<()> {
+        let non_empty = end > start;
+        self.slice_and_bytes(start, end, |this, s| {
+            this.emit_cdata_chunk_str(s, non_empty, is_end)
+        })
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_pi`. The reserved-`[Xx][Mm][Ll]`-target check and the
+    /// namespace-colon check both operate on the already-interned
+    /// `target: Rc<str>` via `.chars()`/`.contains(':')` — pure `&str`
+    /// operations that never touch `self.buf` — so they're reused
+    /// unchanged, same discovery as the entity/attribute-value handler
+    /// calls.
+    #[allow(dead_code)]
+    fn scan_pi_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        let target_start = tag_start + 2;
+        let p = match self.scan_name_chars_bytes(target_start) {
+            NameScanBytes::NeedMore => {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed processing instruction")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == target_start {
+            return Err(self.fatal("Malformed processing instruction"));
+        }
+        self.check_name_start_char_bytes(target_start)?;
+        // SAFETY: [target_start, p) was validated as a legal XML Name by
+        // scan_name_chars_bytes above.
+        let target_str =
+            unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[target_start..p]) };
+        let target = self.name_pool.intern_str(target_str);
+        let tchars: Vec<char> = target.chars().collect();
+        if tchars.len() == 3
+            && (tchars[0] == 'x' || tchars[0] == 'X')
+            && (tchars[1] == 'm' || tchars[1] == 'M')
+            && (tchars[2] == 'l' || tchars[2] == 'L')
+        {
+            return Err(self.fatal("Processing instruction target matching [Xx][Mm][Ll] is reserved"));
+        }
+        if self.namespace_aware && target.contains(':') {
+            let msg = format!(
+                "Processing instruction target \"{target}\" must not contain a colon (Namespaces in XML, Section 6)"
+            );
+            return Err(self.fatal(&msg));
+        }
+        let mut p = p;
+        if p >= self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        if is_ws(self.buf.as_bytes()[p] as char) {
+            p += 1;
+        } else if self.buf.as_bytes()[p] != b'?' {
+            return Err(self.fatal(
+                "White space is required between a processing instruction's target and its data",
+            ));
+        }
+        self.handler.pi_target(&target)?;
+        self.pos = p;
+        if !self.scan_pi_data_bytes()? {
+            self.in_pi = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_pi_data`, built on `scan_until_byte_bytes`.
+    #[allow(dead_code)]
+    fn scan_pi_data_bytes(&mut self) -> ParseResult<bool> {
+        let mut p = self.pos;
+        loop {
+            p = match self.scan_until_byte_bytes(p, b'?')? {
+                LiteralUntilBytes::NeedMore(p) => {
+                    if p > self.pos {
+                        self.slice_and_bytes(self.pos, p, |this, s| this.handler.pi_data(s, false))?;
+                        self.pos = p;
+                    }
+                    return Ok(false);
+                }
+                LiteralUntilBytes::Stop(p) => p,
+            };
+            if p + 1 >= self.limit {
+                if p > self.pos {
+                    self.slice_and_bytes(self.pos, p, |this, s| this.handler.pi_data(s, false))?;
+                    self.pos = p;
+                }
+                return Ok(false);
+            }
+            if self.buf.as_bytes()[p + 1] == b'>' {
+                self.slice_and_bytes(self.pos, p, |this, s| this.handler.pi_data(s, true))?;
+                self.pos = p + 2;
+                return Ok(true);
+            }
+            p += 1;
+        }
+    }
+
     // ===== DOCTYPE / DTD =====
 
     fn match_keyword(&self, p: usize, marker: &str) -> KwResult {
@@ -1947,6 +3574,52 @@ impl<'a> Scanner<'a> {
         p
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `match_keyword`. Every DTD keyword marker (`SYSTEM`, `PUBLIC`,
+    /// `<!ENTITY`, ...) is pure ASCII, so bytes are compared directly
+    /// against `marker.as_bytes()`.
+    #[allow(dead_code)]
+    fn match_keyword_bytes(&self, p: usize, marker: &str) -> KwResult {
+        let marker = marker.as_bytes();
+        let mlen = marker.len();
+        let match_len = mlen.min(self.limit - p);
+        for (i, &mb) in marker.iter().enumerate() {
+            if i >= match_len {
+                break;
+            }
+            if self.buf.as_bytes()[p + i] != mb {
+                return KwResult::NoMatch;
+            }
+        }
+        if p + mlen > self.limit {
+            return KwResult::NeedMore;
+        }
+        KwResult::Match
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_optional_whitespace`. `is_ws` is ASCII-only, so `b as char`
+    /// is safe for every byte value without a multi-byte decode.
+    #[allow(dead_code)]
+    fn skip_optional_whitespace_bytes(&self, mut p: usize) -> usize {
+        while p < self.limit && is_ws(self.buf.as_bytes()[p] as char) {
+            p += 1;
+        }
+        p
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `slice`. Not a hot-path helper (DTD-declaration-time calls only,
+    /// same scope carve-out as `slice` itself), so a plain owned `String`
+    /// is fine.
+    #[allow(dead_code)]
+    fn slice_bytes(&self, start: usize, end: usize) -> String {
+        // SAFETY: every caller passes a range bounded by ASCII delimiters
+        // and/or a previously-validated Name/literal scan, so [start, end)
+        // always lands on a UTF-8 boundary.
+        unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[start..end]) }.to_string()
+    }
+
     fn find_quoted_literal_end(&mut self, mut p: usize) -> ParseResult<Option<usize>> {
         if p >= self.limit {
             return Ok(None);
@@ -1961,6 +3634,31 @@ impl<'a> Scanner<'a> {
                 return Ok(None);
             }
             if self.buf[p] == q {
+                return Ok(Some(p + 1));
+            }
+            p += 1;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `find_quoted_literal_end`. Quote bytes are ASCII, so no byte of a
+    /// multi-byte sequence can ever match one — a raw byte scan is safe
+    /// without any UTF-8 decoding.
+    #[allow(dead_code)]
+    fn find_quoted_literal_end_bytes(&mut self, mut p: usize) -> ParseResult<Option<usize>> {
+        if p >= self.limit {
+            return Ok(None);
+        }
+        let q = self.buf.as_bytes()[p];
+        if q != b'"' && q != b'\'' {
+            return Err(self.fatal("Expected quoted literal"));
+        }
+        p += 1;
+        loop {
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[p] == q {
                 return Ok(Some(p + 1));
             }
             p += 1;
@@ -2042,6 +3740,71 @@ impl<'a> Scanner<'a> {
             Some(r) => r,
         };
         let sysid = self.slice(sys_lit_start, sys_end - 1);
+        self.check_system_literal_no_fragment(&sysid)?;
+        self.last_external_id_system_id = Some(sysid);
+        Ok(Some(sys_end))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_external_id`. A 1:1 structural port onto the byte-native
+    /// primitives above; `check_pubid_literal`/`check_system_literal_no_fragment`
+    /// operate on the decoded `&str` values, never `self.buf`, so they're
+    /// reused unchanged.
+    #[allow(dead_code)]
+    fn skip_external_id_bytes(&mut self, mut p: usize) -> ParseResult<Option<usize>> {
+        let is_public;
+        match self.match_keyword_bytes(p, SYSTEM_MARKER) {
+            KwResult::NeedMore => return Ok(None),
+            KwResult::Match => {
+                is_public = false;
+                p += SYSTEM_MARKER.len();
+            }
+            KwResult::NoMatch => match self.match_keyword_bytes(p, PUBLIC_MARKER) {
+                KwResult::NeedMore => return Ok(None),
+                KwResult::Match => {
+                    is_public = true;
+                    p += PUBLIC_MARKER.len();
+                }
+                KwResult::NoMatch => return Err(self.fatal("Malformed external ID")),
+            },
+        }
+        let ws = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed external ID"));
+        }
+
+        self.last_external_id_public_id = None;
+        self.last_external_id_system_id = None;
+
+        if is_public {
+            let lit_start = p + 1;
+            let r = match self.find_quoted_literal_end_bytes(p)? {
+                None => return Ok(None),
+                Some(r) => r,
+            };
+            let pubid = self.slice_bytes(lit_start, r - 1);
+            self.check_pubid_literal(&pubid)?;
+            self.last_external_id_public_id = Some(pubid);
+            p = r;
+            let ws2 = p;
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if p == ws2 {
+                return Err(self.fatal("Malformed external ID"));
+            }
+        }
+        let sys_lit_start = p + 1;
+        let sys_end = match self.find_quoted_literal_end_bytes(p)? {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+        let sysid = self.slice_bytes(sys_lit_start, sys_end - 1);
         self.check_system_literal_no_fragment(&sysid)?;
         self.last_external_id_system_id = Some(sysid);
         Ok(Some(sys_end))
@@ -2159,6 +3922,122 @@ impl<'a> Scanner<'a> {
         Ok(Some(p))
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_notation_declaration`. Name scanning goes through
+    /// `scan_name_chars_bytes`/`check_name_start_char_bytes`; everything
+    /// else is a 1:1 port onto the byte-native primitives above.
+    #[allow(dead_code)]
+    fn scan_notation_declaration_bytes(&mut self, mut p: usize) -> ParseResult<Option<usize>> {
+        let ws = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed notation declaration"));
+        }
+        let name_start = p;
+        p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed notation declaration")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed notation declaration"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name = self.slice_bytes(name_start, p);
+        self.check_no_colon_in_namespace_mode(&name, "Notation")?;
+
+        let ws2 = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws2 {
+            return Err(self.fatal("Malformed notation declaration"));
+        }
+
+        let is_public;
+        match self.match_keyword_bytes(p, SYSTEM_MARKER) {
+            KwResult::NeedMore => return Ok(None),
+            KwResult::Match => {
+                is_public = false;
+                p += SYSTEM_MARKER.len();
+            }
+            KwResult::NoMatch => match self.match_keyword_bytes(p, PUBLIC_MARKER) {
+                KwResult::NeedMore => return Ok(None),
+                KwResult::Match => {
+                    is_public = true;
+                    p += PUBLIC_MARKER.len();
+                }
+                KwResult::NoMatch => return Err(self.fatal("Malformed notation declaration")),
+            },
+        }
+        let ws3 = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws3 {
+            return Err(self.fatal("Malformed notation declaration"));
+        }
+        let r = match self.find_quoted_literal_end_bytes(p)? {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+        let mut public_id: Option<String> = None;
+        let mut system_id: Option<String> = None;
+        if is_public {
+            let pid = self.slice_bytes(p + 1, r - 1);
+            self.check_pubid_literal(&pid)?;
+            public_id = Some(pid);
+        } else {
+            system_id = Some(self.slice_bytes(p + 1, r - 1));
+        }
+        p = r;
+
+        if is_public {
+            let after_ws = self.skip_optional_whitespace_bytes(p);
+            if after_ws >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[after_ws] == b'"' || self.buf.as_bytes()[after_ws] == b'\'' {
+                let r2 = match self.find_quoted_literal_end_bytes(after_ws)? {
+                    None => return Ok(None),
+                    Some(r) => r,
+                };
+                system_id = Some(self.slice_bytes(after_ws + 1, r2 - 1));
+                p = r2;
+            }
+        }
+
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if self.buf.as_bytes()[p] != b'>' {
+            return Err(self.fatal("Malformed notation declaration"));
+        }
+        p += 1;
+
+        if let Some(sid) = &system_id {
+            self.check_system_literal_no_fragment(sid)?;
+        }
+        if self.declared_notations.insert(name.clone()) {
+            self.notation_external_ids.insert(
+                name.clone(),
+                ExternalId {
+                    public_id: public_id.clone(),
+                    system_id: system_id.clone(),
+                },
+            );
+            self.handler
+                .notation_decl(&name, public_id.as_deref(), system_id.as_deref())?;
+        }
+        Ok(Some(p))
+    }
+
     fn decode_char_ref_into(&mut self, sb: &mut String, q: usize) -> ParseResult<Option<usize>> {
         let mut p = q + 2;
         let mut hex = false;
@@ -2187,6 +4066,56 @@ impl<'a> Scanner<'a> {
         }
         let digits: String = self.buf[digits_start..p].iter().collect();
         let code_point = match u32::from_str_radix(&digits, if hex { 16 } else { 10 }) {
+            Ok(v) => v,
+            Err(_) => return Err(self.fatal("Malformed character reference")),
+        };
+        if !is_legal_char_ref_code_point(code_point, self.xml11) {
+            let msg = format!("Character reference out of range: {code_point}");
+            return Err(self.fatal(&msg));
+        }
+        self.last_char_ref_code_point = code_point;
+        let ch = char::from_u32(code_point)
+            .ok_or_else(|| ParseError::new("Character reference out of range"))?;
+        sb.push(ch);
+        Ok(Some(p + 1))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `decode_char_ref_into`. Digits, `x`, and `;` are all ASCII, so no
+    /// multi-byte decoding is ever needed here (same reasoning as
+    /// `decode_entity_ref_bytes`'s numeric-reference branch).
+    #[allow(dead_code)]
+    fn decode_char_ref_into_bytes(&mut self, sb: &mut String, q: usize) -> ParseResult<Option<usize>> {
+        let mut p = q + 2;
+        let mut hex = false;
+        if p < self.limit && self.buf.as_bytes()[p] == b'x' {
+            hex = true;
+            p += 1;
+        }
+        let digits_start = p;
+        while p < self.limit && self.buf.as_bytes()[p] != b';' {
+            let d = self.buf.as_bytes()[p];
+            let ok = if hex {
+                d.is_ascii_hexdigit()
+            } else {
+                d.is_ascii_digit()
+            };
+            if !ok {
+                return Err(self.fatal("Malformed character reference"));
+            }
+            p += 1;
+        }
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == digits_start {
+            return Err(self.fatal("Empty character reference"));
+        }
+        // SAFETY: every byte in [digits_start, p) was just checked to be an
+        // ASCII hex/decimal digit.
+        let digits =
+            unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[digits_start..p]) };
+        let code_point = match u32::from_str_radix(digits, if hex { 16 } else { 10 }) {
             Ok(v) => v,
             Err(_) => return Err(self.fatal("Malformed character reference")),
         };
@@ -2272,6 +4201,105 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_quoted_literal_with_char_refs`. Every structural byte checked
+    /// here (quote, `&`, `#`, `%`) is ASCII; the rare non-ASCII literal
+    /// character is decoded on demand, same pattern as every other
+    /// byte-native scanner. `resolve_parameter_entity_replacement`'s
+    /// `Rc<[char]>` result is pushed into `sb` char-by-char exactly like
+    /// the char path — that step was never representation-dependent.
+    #[allow(dead_code)]
+    fn scan_quoted_literal_with_char_refs_bytes(
+        &mut self,
+        p: usize,
+        sb: &mut String,
+        is_entity_value: bool,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<Option<usize>> {
+        let quote = self.buf.as_bytes()[p];
+        let mut q = p + 1;
+        self.last_literal_contained_restricted_char = false;
+        loop {
+            if q >= self.limit {
+                return Ok(None);
+            }
+            let b = self.buf.as_bytes()[q];
+            if b == quote {
+                return Ok(Some(q + 1));
+            }
+            if b == b'&' && q + 1 < self.limit && self.buf.as_bytes()[q + 1] == b'#' {
+                match self.decode_char_ref_into_bytes(sb, q)? {
+                    None => return Ok(None),
+                    Some(r) => {
+                        if is_entity_value
+                            && self.xml11
+                            && self.last_char_ref_code_point <= 0xFFFF
+                            && is_restricted_char_xml11(
+                                char::from_u32(self.last_char_ref_code_point).unwrap_or('\u{0}'),
+                            )
+                        {
+                            self.last_literal_contained_restricted_char = true;
+                        }
+                        q = r;
+                        continue;
+                    }
+                }
+            }
+            if b == b'&' && q + 1 >= self.limit {
+                return Ok(None);
+            }
+            if b == b'&' {
+                match self.scan_reference_name_literal_bytes(q, sb, '&')? {
+                    None => return Ok(None),
+                    Some(r) => {
+                        q = r;
+                        continue;
+                    }
+                }
+            }
+            if is_entity_value && b == b'%' {
+                if q + 1 >= self.limit {
+                    return Ok(None);
+                }
+                match self.resolve_parameter_entity_reference_at_bytes(q, pending)? {
+                    None => return Ok(None),
+                    Some(replacement) => {
+                        for rc in replacement.iter() {
+                            sb.push(*rc);
+                        }
+                        q = self.last_pe_reference_end;
+                        continue;
+                    }
+                }
+            }
+            if b < 0x80 {
+                if !self.is_legal_literal_char(b as char) {
+                    return Err(self.illegal_char_error(b as char));
+                }
+                sb.push(b as char);
+                q += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 {
+                return Err(self.fatal("Ill-formed UTF-8 sequence"));
+            }
+            if q + seq_len > self.limit {
+                return Ok(None);
+            }
+            let slice = &self.buf.as_bytes()[q..q + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+            };
+            if !self.is_legal_literal_char(c) {
+                return Err(self.illegal_char_error(c));
+            }
+            sb.push(c);
+            q += seq_len;
+        }
+    }
+
     fn scan_reference_name_literal(
         &mut self,
         q: usize,
@@ -2299,6 +4327,42 @@ impl<'a> Scanner<'a> {
         for i in q..=r {
             sb.push(self.buf[i]);
         }
+        Ok(Some(r + 1))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_reference_name_literal`. `[q, r+1)` spans the ASCII marker
+    /// byte (`&`/`%`), a validated Name (`scan_name_chars_bytes` already
+    /// confirms `End(r)` only ever lands at a byte boundary, since it
+    /// advances a whole UTF-8 sequence at a time), and the ASCII `;` — so
+    /// the whole range decodes as one `push_str`, no char-by-char loop
+    /// needed.
+    #[allow(dead_code)]
+    fn scan_reference_name_literal_bytes(
+        &mut self,
+        q: usize,
+        sb: &mut String,
+        marker: char,
+    ) -> ParseResult<Option<usize>> {
+        let name_start = q + 1;
+        let r = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed reference")),
+            NameScanBytes::End(r) => r,
+        };
+        if r == name_start || self.buf.as_bytes()[r] != b';' {
+            let kind = if marker == '%' {
+                "parameter entity"
+            } else {
+                "entity"
+            };
+            let msg = format!("A literal '{marker}' must begin a {kind} reference ({marker}Name;)");
+            return Err(self.fatal(&msg));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        // SAFETY: see doc comment above.
+        let literal = unsafe { std::str::from_utf8_unchecked(&self.buf.as_bytes()[q..=r]) };
+        sb.push_str(literal);
         Ok(Some(r + 1))
     }
 
@@ -2521,6 +4585,214 @@ impl<'a> Scanner<'a> {
         Ok(Some(p))
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_entity_declaration`. A 1:1 structural port onto the
+    /// byte-native primitives above; `check_no_colon_in_namespace_mode`/
+    /// `check_not_from_pe_splice` and the `pending`/`self.*_entities`
+    /// bookkeeping are unchanged since none of it touches `self.buf`.
+    #[allow(dead_code)]
+    fn scan_entity_declaration_bytes(
+        &mut self,
+        mut p: usize,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<Option<usize>> {
+        self.saw_splice_since_declaration_start = false;
+        let ws = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed entity declaration"));
+        }
+
+        let mut is_param = false;
+        if self.buf.as_bytes()[p] == b'%' {
+            is_param = true;
+            let ws3 = p + 1;
+            p = self.skip_optional_whitespace_bytes(p + 1);
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if p == ws3 {
+                return Err(self.fatal("Malformed parameter entity declaration"));
+            }
+        }
+
+        let name_start = p;
+        p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed entity declaration")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed entity declaration"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name = self.slice_bytes(name_start, p);
+        self.check_no_colon_in_namespace_mode(&name, "Entity")?;
+
+        let ws2 = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws2 {
+            return Err(self.fatal("Malformed entity declaration"));
+        }
+
+        if self.buf.as_bytes()[p] == b'"' || self.buf.as_bytes()[p] == b'\'' {
+            let mut sb = String::new();
+            let q = match self.scan_quoted_literal_with_char_refs_bytes(p, &mut sb, true, pending)?
+            {
+                None => return Ok(None),
+                Some(q) => q,
+            };
+            p = q;
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[p] != b'>' {
+                return Err(self.fatal("Malformed entity declaration"));
+            }
+            self.check_not_from_pe_splice(p, "an <!ENTITY> declaration")?;
+            p += 1;
+
+            if is_param {
+                if !pending.param_entities.contains_key(&name)
+                    && !pending.param_external_names.contains_key(&name)
+                    && !self.parameter_entities.contains_key(&name)
+                    && !self.parameter_entity_external_ids.contains_key(&name)
+                {
+                    let decoded: Rc<[char]> = sb.chars().collect::<Vec<char>>().into();
+                    pending.param_entities.insert(name.clone(), decoded);
+                    self.handler.internal_entity_decl(&format!("%{name}"), &sb)?;
+                }
+            } else if !pending.entities.contains_key(&name)
+                && !pending.external_names.contains_key(&name)
+                && !self.general_entities.contains_key(&name)
+                && !self.external_entity_names.contains_key(&name)
+            {
+                let decoded: Rc<[char]> = sb.chars().collect::<Vec<char>>().into();
+                pending.entities.insert(name.clone(), decoded);
+                self.handler.internal_entity_decl(&name, &sb)?;
+                if self.last_literal_contained_restricted_char {
+                    self.restricted_char_entities.insert(name.clone());
+                }
+                if self.parsing_external_content {
+                    self.externally_declared_general_entities.insert(name.clone());
+                }
+            }
+            return Ok(Some(p));
+        }
+
+        let r = match self.skip_external_id_bytes(p)? {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+        let ext_public_id = self.last_external_id_public_id.clone();
+        let ext_system_id = self.last_external_id_system_id.clone();
+        p = r;
+
+        let ws_before_ndata = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            return Ok(None);
+        }
+        let mut ndata_name: Option<String> = None;
+        if self.buf.as_bytes()[p] != b'>' {
+            match self.match_keyword_bytes(p, NDATA_MARKER) {
+                KwResult::NeedMore => return Ok(None),
+                KwResult::Match => {}
+                KwResult::NoMatch => return Err(self.fatal("Malformed entity declaration")),
+            }
+            if p == ws_before_ndata {
+                return Err(self.fatal("White space is required before \"NDATA\""));
+            }
+            if is_param {
+                return Err(self.fatal("Parameter entities may not have an NDATA annotation"));
+            }
+            p += NDATA_MARKER.len();
+            let ws_n = p;
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if p == ws_n {
+                return Err(self.fatal("Malformed entity declaration"));
+            }
+            let ndata_name_start = p;
+            p = match self.scan_name_chars_bytes(ndata_name_start) {
+                NameScanBytes::NeedMore => return Ok(None),
+                NameScanBytes::Illegal => {
+                    return Err(self.fatal("Malformed entity declaration"));
+                }
+                NameScanBytes::End(p) => p,
+            };
+            if p == ndata_name_start {
+                return Err(self.fatal("Malformed entity declaration"));
+            }
+            self.check_name_start_char_bytes(ndata_name_start)?;
+            ndata_name = Some(self.slice_bytes(ndata_name_start, p));
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[p] != b'>' {
+                return Err(self.fatal("Malformed entity declaration"));
+            }
+        }
+        self.check_not_from_pe_splice(p, "an <!ENTITY> declaration")?;
+        p += 1;
+
+        if is_param {
+            if !pending.param_entities.contains_key(&name)
+                && !pending.param_external_names.contains_key(&name)
+                && !self.parameter_entities.contains_key(&name)
+                && !self.parameter_entity_external_ids.contains_key(&name)
+            {
+                pending.param_external_names.insert(
+                    name.clone(),
+                    ExtPe {
+                        public_id: ext_public_id.clone(),
+                        system_id: ext_system_id.clone(),
+                        decl_base: self.base_system_id.clone(),
+                    },
+                );
+                self.handler.external_entity_decl(
+                    &format!("%{name}"),
+                    ext_public_id.as_deref(),
+                    ext_system_id.as_deref().unwrap_or(""),
+                )?;
+            }
+        } else if !pending.entities.contains_key(&name)
+            && !pending.external_names.contains_key(&name)
+            && !self.general_entities.contains_key(&name)
+            && !self.external_entity_names.contains_key(&name)
+        {
+            pending.external_names.insert(
+                name.clone(),
+                ExtEntity {
+                    public_id: ext_public_id.clone(),
+                    system_id: ext_system_id.clone(),
+                    ndata: ndata_name.clone(),
+                },
+            );
+            if ndata_name.is_none() {
+                self.handler.external_entity_decl(
+                    &name,
+                    ext_public_id.as_deref(),
+                    ext_system_id.as_deref().unwrap_or(""),
+                )?;
+            }
+            if self.parsing_external_content {
+                self.externally_declared_general_entities.insert(name.clone());
+            }
+        }
+        Ok(Some(p))
+    }
+
     fn scan_enumeration_list(
         &mut self,
         p: usize,
@@ -2563,6 +4835,60 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             if self.buf[q] == ')' {
+                q += 1;
+                break;
+            }
+            return Err(self.fatal("Malformed enumeration"));
+        }
+        self.last_enumeration_values = Some(values);
+        Ok(Some(q))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_enumeration_list`. A 1:1 structural port onto the byte-native
+    /// primitives above.
+    #[allow(dead_code)]
+    fn scan_enumeration_list_bytes(
+        &mut self,
+        p: usize,
+        require_name_start_char: bool,
+    ) -> ParseResult<Option<usize>> {
+        let mut values: Vec<String> = Vec::new();
+        let mut q = p + 1;
+        loop {
+            q = self.skip_optional_whitespace_bytes(q);
+            if q >= self.limit {
+                return Ok(None);
+            }
+            let token_start = q;
+            q = match self.scan_name_chars_bytes(token_start) {
+                NameScanBytes::NeedMore => return Ok(None),
+                NameScanBytes::Illegal => return Err(self.fatal("Malformed enumeration")),
+                NameScanBytes::End(q) => q,
+            };
+            if q == token_start {
+                return Err(self.fatal("Malformed enumeration"));
+            }
+            if require_name_start_char {
+                self.check_name_start_char_bytes(token_start)?;
+            }
+            let token = self.slice_bytes(token_start, q);
+            if self.validation_enabled && values.contains(&token) {
+                let msg = format!(
+                    "Validity Constraint: No Duplicate Types (Section 3.3.1). \"{token}\" appears more than once in this attribute's enumerated type."
+                );
+                self.handler.error(&msg)?;
+            }
+            values.push(token);
+            q = self.skip_optional_whitespace_bytes(q);
+            if q >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[q] == b'|' {
+                q += 1;
+                continue;
+            }
+            if self.buf.as_bytes()[q] == b')' {
                 q += 1;
                 break;
             }
@@ -2682,6 +5008,152 @@ impl<'a> Scanner<'a> {
             return Ok(None);
         }
         if self.buf[p] != '>' {
+            return Err(self.fatal("Malformed element declaration"));
+        }
+        self.check_not_from_pe_splice(p, "an <!ELEMENT> declaration")?;
+        p += 1;
+
+        if self.validation_enabled && self.dtd_model.get_element_declaration(&name).is_some() {
+            let msg = format!(
+                "Validity Constraint: Unique Element Type Declaration (Section 3.2). Element \"{name}\" is already declared."
+            );
+            self.handler.error(&msg)?;
+        }
+        let mut decl = ElementDeclaration::new(name.clone(), content_type);
+        decl.content_model = model.clone();
+        decl.from_external_subset = self.parsing_external_content;
+        let model_str = match &model {
+            Some(m) => m.to_string(),
+            None => content_type.name().to_string(),
+        };
+        if self.dtd_model.declare_element(&name, decl) {
+            self.handler.element_decl(&name, &model_str)?;
+        }
+        Ok(Some(p))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_element_declaration`. A 1:1 structural port onto the
+    /// byte-native primitives above, including `splice_pe_reference_at_bytes`
+    /// for PE references used as declaration separators or inside the
+    /// content model text itself (both real, if uncommon, cases in
+    /// external-subset DTDs). Once the matching close-paren is located,
+    /// `self.cm_pos`/`self.cm_end` mark a byte range for
+    /// `parse_content_model_group_bytes` to walk -- content model text is
+    /// always fully buffered by this point.
+    #[allow(dead_code)]
+    fn scan_element_declaration_bytes(
+        &mut self,
+        mut p: usize,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<Option<usize>> {
+        self.saw_splice_since_declaration_start = false;
+        let ws = p;
+        p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed element declaration"));
+        }
+
+        let name_start = p;
+        p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed element declaration")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed element declaration"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name = self.slice_bytes(name_start, p);
+
+        let ws2 = p;
+        let validation = self.validation_enabled;
+        p = self.skip_whitespace_in_declaration_bytes(p, pending, validation)?;
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws2 {
+            return Err(self.fatal("Malformed element declaration"));
+        }
+
+        let content_type;
+        let mut model: Option<ContentModel> = None;
+        match self.match_keyword_bytes(p, EMPTY_MARKER) {
+            KwResult::NeedMore => return Ok(None),
+            KwResult::Match => {
+                content_type = ContentType::Empty;
+                p += EMPTY_MARKER.len();
+            }
+            KwResult::NoMatch => match self.match_keyword_bytes(p, ANY_MARKER) {
+                KwResult::NeedMore => return Ok(None),
+                KwResult::Match => {
+                    content_type = ContentType::Any;
+                    p += ANY_MARKER.len();
+                }
+                KwResult::NoMatch => {
+                    if p >= self.limit {
+                        return Ok(None);
+                    }
+                    if self.buf.as_bytes()[p] != b'(' {
+                        return Err(self.fatal("Malformed element declaration"));
+                    }
+                    let model_start = p;
+                    let after_paren = self.skip_optional_whitespace_bytes(p + 1);
+                    if after_paren >= self.limit {
+                        return Ok(None);
+                    }
+                    match self.match_keyword_bytes(after_paren, PCDATA_MARKER) {
+                        KwResult::NeedMore => return Ok(None),
+                        KwResult::Match => content_type = ContentType::Mixed,
+                        KwResult::NoMatch => content_type = ContentType::Element,
+                    }
+                    let mut depth = 0i32;
+                    loop {
+                        if p >= self.limit {
+                            return Ok(None);
+                        }
+                        let c = self.buf.as_bytes()[p];
+                        if c == b'%' {
+                            p = self.splice_pe_reference_at_bytes(p, pending, validation)?;
+                            if p >= self.limit {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+                        p += 1;
+                        if c == b'(' {
+                            depth += 1;
+                        } else if c == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if p >= self.limit {
+                        return Ok(None);
+                    }
+                    if self.buf.as_bytes()[p] == b'?'
+                        || self.buf.as_bytes()[p] == b'*'
+                        || self.buf.as_bytes()[p] == b'+'
+                    {
+                        p += 1;
+                    }
+                    self.cm_pos = model_start;
+                    self.cm_end = p;
+                    model = Some(self.parse_content_model_group_bytes(true)?);
+                }
+            },
+        }
+
+        p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if self.buf.as_bytes()[p] != b'>' {
             return Err(self.fatal("Malformed element declaration"));
         }
         self.check_not_from_pe_splice(p, "an <!ELEMENT> declaration")?;
@@ -2890,6 +5362,241 @@ impl<'a> Scanner<'a> {
         true
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_cm_whitespace`.
+    #[allow(dead_code)]
+    fn skip_cm_whitespace_bytes(&self, mut p: usize) -> usize {
+        while p < self.cm_end && is_ws(self.buf.as_bytes()[p] as char) {
+            p += 1;
+        }
+        p
+    }
+
+    /// Exploratory (explore/utf8-byte-path): advances `self.cm_pos` past a
+    /// run of NameChars, bounded by `self.cm_end` rather than `self.limit`
+    /// -- unlike every other name-scanning helper in this file, content
+    /// model text is always fully buffered by the time this runs (the
+    /// caller only invokes `parse_content_model_group_bytes` after
+    /// locating the matching close-paren via a full depth-tracking scan),
+    /// so there's no `NeedMore` outcome to report here at all.
+    #[allow(dead_code)]
+    fn advance_cm_name_bytes(&mut self) -> ParseResult<()> {
+        loop {
+            if self.cm_pos >= self.cm_end {
+                return Ok(());
+            }
+            let b = self.buf.as_bytes()[self.cm_pos];
+            if b < 0x80 {
+                if !is_name_char(b as char) {
+                    return Ok(());
+                }
+                self.cm_pos += 1;
+                continue;
+            }
+            let seq_len = utf8_seq_len(b);
+            if seq_len == 0 || self.cm_pos + seq_len > self.cm_end {
+                return Err(self.fatal("Ill-formed UTF-8 sequence"));
+            }
+            let slice = &self.buf.as_bytes()[self.cm_pos..self.cm_pos + seq_len];
+            let c = match std::str::from_utf8(slice) {
+                Ok(s) => s.chars().next().unwrap(),
+                Err(_) => return Err(self.fatal("Ill-formed UTF-8 sequence")),
+            };
+            if !is_name_char(c) {
+                return Ok(());
+            }
+            self.cm_pos += seq_len;
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `read_cm_occurrence`. `?`/`*`/`+` are ASCII.
+    #[allow(dead_code)]
+    fn read_cm_occurrence_bytes(&mut self) -> Occurrence {
+        if self.cm_pos < self.cm_end {
+            let b = self.buf.as_bytes()[self.cm_pos];
+            if b == b'?' {
+                self.cm_pos += 1;
+                return Occurrence::Optional;
+            }
+            if b == b'*' {
+                self.cm_pos += 1;
+                return Occurrence::ZeroOrMore;
+            }
+            if b == b'+' {
+                self.cm_pos += 1;
+                return Occurrence::OneOrMore;
+            }
+        }
+        Occurrence::Once
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `parse_content_model_particle`.
+    #[allow(dead_code)]
+    fn parse_content_model_particle_bytes(&mut self) -> ParseResult<ContentModel> {
+        self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+        if self.cm_pos < self.cm_end && self.buf.as_bytes()[self.cm_pos] == b'(' {
+            return self.parse_content_model_group_bytes(false);
+        }
+        let name_start = self.cm_pos;
+        self.advance_cm_name_bytes()?;
+        if self.cm_pos == name_start {
+            return Err(self.fatal("Malformed content model"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let element_name = self.slice_bytes(name_start, self.cm_pos);
+        let occ = self.read_cm_occurrence_bytes();
+        Ok(ContentModel::leaf(NodeType::Element, Some(element_name), occ))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `parse_content_model_group`. A 1:1 structural port -- every
+    /// structural byte checked here (`(`, `)`, `|`, `,`, `?`, `*`, `+`,
+    /// whitespace, `#PCDATA`) is ASCII; only element-name scanning can be
+    /// multi-byte, handled via `advance_cm_name_bytes`.
+    #[allow(dead_code)]
+    fn parse_content_model_group_bytes(&mut self, allow_mixed: bool) -> ParseResult<ContentModel> {
+        self.cm_pos += 1; // consume '('
+        self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+        let pm = self.match_keyword_cm_bytes(self.cm_pos, PCDATA_MARKER);
+        if pm && !allow_mixed {
+            return Err(self.fatal(
+                "\"#PCDATA\" is only legal in an element declaration's own outermost content model group, not nested inside another group",
+            ));
+        }
+        if pm {
+            self.cm_pos += PCDATA_MARKER.len();
+            let mut children: Vec<ContentModel> = Vec::new();
+            children.push(ContentModel::leaf(NodeType::Pcdata, None, Occurrence::Once));
+            self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+            while self.cm_pos < self.cm_end && self.buf.as_bytes()[self.cm_pos] == b'|' {
+                self.cm_pos += 1;
+                self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+                let name_start = self.cm_pos;
+                self.advance_cm_name_bytes()?;
+                if self.cm_pos == name_start {
+                    return Err(self.fatal("Malformed content model"));
+                }
+                self.check_name_start_char_bytes(name_start)?;
+                let mixed_name = self.slice_bytes(name_start, self.cm_pos);
+                if self.validation_enabled {
+                    let dup = children.iter().skip(1).any(|c| {
+                        c.element_name.as_deref() == Some(mixed_name.as_str())
+                    });
+                    if dup {
+                        let msg = format!(
+                            "Validity Constraint: No Duplicate Types (Section 3.3.1). \"{mixed_name}\" appears more than once in this mixed-content declaration."
+                        );
+                        self.handler.error(&msg)?;
+                    }
+                }
+                children.push(ContentModel::leaf(
+                    NodeType::Element,
+                    Some(mixed_name),
+                    Occurrence::Once,
+                ));
+                self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+            }
+            if self.cm_pos >= self.cm_end || self.buf.as_bytes()[self.cm_pos] != b')' {
+                return Err(self.fatal("Malformed content model"));
+            }
+            self.cm_pos += 1;
+            let has_element_names = children.len() > 1;
+            let occ;
+            if has_element_names {
+                if self.cm_pos >= self.cm_end || self.buf.as_bytes()[self.cm_pos] != b'*' {
+                    return Err(self.fatal(
+                        "A mixed-content declaration with element names must end with \")*\"",
+                    ));
+                }
+                self.cm_pos += 1;
+                occ = Occurrence::ZeroOrMore;
+            } else if self.cm_pos < self.cm_end
+                && (self.buf.as_bytes()[self.cm_pos] == b'?'
+                    || self.buf.as_bytes()[self.cm_pos] == b'+')
+            {
+                let ch = self.buf.as_bytes()[self.cm_pos] as char;
+                let msg = format!(
+                    "\"(#PCDATA)\" may not be followed by a \"{ch}\" occurrence indicator"
+                );
+                return Err(self.fatal(&msg));
+            } else if self.cm_pos < self.cm_end && self.buf.as_bytes()[self.cm_pos] == b'*' {
+                self.cm_pos += 1;
+                occ = Occurrence::ZeroOrMore;
+            } else {
+                occ = Occurrence::Once;
+            }
+            return Ok(ContentModel::group(NodeType::Choice, children, occ));
+        }
+
+        let mut children: Vec<ContentModel> = Vec::new();
+        children.push(self.parse_content_model_particle_bytes()?);
+        self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+        let mut separator = '\u{0}';
+        while self.cm_pos < self.cm_end
+            && (self.buf.as_bytes()[self.cm_pos] == b',' || self.buf.as_bytes()[self.cm_pos] == b'|')
+        {
+            let sep = self.buf.as_bytes()[self.cm_pos] as char;
+            if separator == '\u{0}' {
+                separator = sep;
+            } else if separator != sep {
+                return Err(self.fatal("Cannot mix ',' and '|' within the same content model group"));
+            }
+            self.cm_pos += 1;
+            self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+            children.push(self.parse_content_model_particle_bytes()?);
+            self.cm_pos = self.skip_cm_whitespace_bytes(self.cm_pos);
+        }
+        if self.cm_pos >= self.cm_end || self.buf.as_bytes()[self.cm_pos] != b')' {
+            return Err(self.fatal("Malformed content model"));
+        }
+        self.cm_pos += 1;
+        let group_occ = self.read_cm_occurrence_bytes();
+        let group_type = if separator == '|' {
+            NodeType::Choice
+        } else {
+            NodeType::Sequence
+        };
+        if group_type == NodeType::Choice {
+            for i in 0..children.len() {
+                if children[i].node_type != NodeType::Element {
+                    continue;
+                }
+                for j in 0..i {
+                    if children[j].node_type == NodeType::Element
+                        && children[i].element_name == children[j].element_name
+                    {
+                        let dup = children[i].element_name.clone().unwrap_or_default();
+                        let msg = format!(
+                            "Validity Constraint: No Duplicate Types (Section 3.3.1). \"{dup}\" appears more than once in this choice group."
+                        );
+                        self.handler.error(&msg)?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ContentModel::group(group_type, children, group_occ))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `match_keyword_cm`. `PCDATA_MARKER` is pure ASCII.
+    #[allow(dead_code)]
+    fn match_keyword_cm_bytes(&self, p: usize, marker: &str) -> bool {
+        let marker = marker.as_bytes();
+        let mlen = marker.len();
+        if p + mlen > self.cm_end {
+            return false;
+        }
+        for (i, &mb) in marker.iter().enumerate() {
+            if self.buf.as_bytes()[p + i] != mb {
+                return false;
+            }
+        }
+        true
+    }
+
     // ===== ATTLIST =====
 
     fn check_attlist_declaration_vcs(
@@ -2980,7 +5687,7 @@ impl<'a> Scanner<'a> {
             self.check_name_start_char(attr_name_start)?;
             let attr_name = self
                 .name_pool
-                .intern_range(&self.buf, attr_name_start, p - attr_name_start);
+                .intern_range(self.buf.as_chars(), attr_name_start, p - attr_name_start);
 
             let ws3 = p;
             p = self.skip_whitespace_in_declaration(p, pending, false)?;
@@ -3150,6 +5857,246 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_attlist_declaration`. A 1:1 structural port onto the
+    /// byte-native primitives above; `check_attlist_declaration_vcs`/
+    /// `check_attlist_default_entities_declared` and the `dtd_model`
+    /// bookkeeping are unchanged since neither touches `self.buf`.
+    #[allow(dead_code)]
+    fn scan_attlist_declaration_bytes(
+        &mut self,
+        mut p: usize,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<Option<usize>> {
+        self.saw_splice_since_declaration_start = false;
+        let ws = p;
+        p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+        if p >= self.limit {
+            return Ok(None);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed attribute-list declaration"));
+        }
+        let name_start = p;
+        p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed attribute-list declaration"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let element_name = self.slice_bytes(name_start, p);
+
+        loop {
+            let ws2 = p;
+            p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if self.buf.as_bytes()[p] == b'>' {
+                self.check_not_from_pe_splice(p, "an <!ATTLIST> declaration")?;
+                p += 1;
+                return Ok(Some(p));
+            }
+            if p == ws2 {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+
+            let attr_name_start = p;
+            p = match self.scan_name_chars_bytes(attr_name_start) {
+                NameScanBytes::NeedMore => return Ok(None),
+                NameScanBytes::Illegal => {
+                    return Err(self.fatal("Malformed attribute-list declaration"));
+                }
+                NameScanBytes::End(p) => p,
+            };
+            if p == attr_name_start {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+            self.check_name_start_char_bytes(attr_name_start)?;
+            // SAFETY: [attr_name_start, p) was validated as a legal XML
+            // Name by scan_name_chars_bytes above.
+            let attr_name_str = unsafe {
+                std::str::from_utf8_unchecked(&self.buf.as_bytes()[attr_name_start..p])
+            };
+            let attr_name = self.name_pool.intern_str(attr_name_str);
+
+            let ws3 = p;
+            p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if p == ws3 {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+
+            let ty;
+            let mut enumeration: Option<Vec<String>> = None;
+            if self.buf.as_bytes()[p] == b'(' {
+                ty = "ENUMERATION".to_string();
+                let r = match self.scan_enumeration_list_bytes(p, false)? {
+                    None => return Ok(None),
+                    Some(r) => r,
+                };
+                p = r;
+                enumeration = self.last_enumeration_values.clone();
+            } else {
+                let type_start = p;
+                p = match self.scan_name_chars_bytes(type_start) {
+                    NameScanBytes::NeedMore => return Ok(None),
+                    NameScanBytes::Illegal => {
+                        return Err(self.fatal("Malformed attribute-list declaration"));
+                    }
+                    NameScanBytes::End(p) => p,
+                };
+                if p == type_start {
+                    return Err(self.fatal("Malformed attribute-list declaration"));
+                }
+                ty = self.slice_bytes(type_start, p);
+                if !matches!(
+                    ty.as_str(),
+                    "CDATA"
+                        | "ID"
+                        | "IDREF"
+                        | "IDREFS"
+                        | "ENTITY"
+                        | "ENTITIES"
+                        | "NMTOKEN"
+                        | "NMTOKENS"
+                        | "NOTATION"
+                ) {
+                    let msg = format!("Unrecognised attribute type \"{ty}\"");
+                    return Err(self.fatal(&msg));
+                }
+                if ty == "NOTATION" {
+                    let ws3b = p;
+                    p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+                    if p >= self.limit {
+                        return Ok(None);
+                    }
+                    if p == ws3b {
+                        return Err(self.fatal("Malformed attribute-list declaration"));
+                    }
+                    if self.buf.as_bytes()[p] != b'(' {
+                        return Err(self.fatal("Malformed attribute-list declaration"));
+                    }
+                    let r = match self.scan_enumeration_list_bytes(p, true)? {
+                        None => return Ok(None),
+                        Some(r) => r,
+                    };
+                    p = r;
+                    enumeration = self.last_enumeration_values.clone();
+                }
+            }
+
+            let ws4 = p;
+            p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+            if p >= self.limit {
+                return Ok(None);
+            }
+            if p == ws4 {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+
+            let raw_default: Option<String>;
+            let mode;
+            if self.buf.as_bytes()[p] == b'#' {
+                match self.match_keyword_bytes(p, REQUIRED_MARKER) {
+                    KwResult::NeedMore => return Ok(None),
+                    KwResult::Match => {
+                        p += REQUIRED_MARKER.len();
+                        raw_default = None;
+                        mode = Mode::Required;
+                    }
+                    KwResult::NoMatch => match self.match_keyword_bytes(p, IMPLIED_MARKER) {
+                        KwResult::NeedMore => return Ok(None),
+                        KwResult::Match => {
+                            p += IMPLIED_MARKER.len();
+                            raw_default = None;
+                            mode = Mode::Implied;
+                        }
+                        KwResult::NoMatch => match self.match_keyword_bytes(p, FIXED_MARKER) {
+                            KwResult::NeedMore => return Ok(None),
+                            KwResult::NoMatch => {
+                                return Err(self.fatal("Malformed attribute-list declaration"))
+                            }
+                            KwResult::Match => {
+                                p += FIXED_MARKER.len();
+                                let ws5 = p;
+                                p = self.skip_whitespace_in_declaration_bytes(p, pending, false)?;
+                                if p >= self.limit {
+                                    return Ok(None);
+                                }
+                                if p == ws5 {
+                                    return Err(self.fatal("Malformed attribute-list declaration"));
+                                }
+                                if self.buf.as_bytes()[p] != b'"' && self.buf.as_bytes()[p] != b'\''
+                                {
+                                    return Err(self.fatal("Malformed attribute-list declaration"));
+                                }
+                                let mut sb = String::new();
+                                let r = match self.scan_quoted_literal_with_char_refs_bytes(
+                                    p, &mut sb, false, pending,
+                                )? {
+                                    None => return Ok(None),
+                                    Some(r) => r,
+                                };
+                                p = r;
+                                raw_default = Some(sb);
+                                mode = Mode::Fixed;
+                            }
+                        },
+                    },
+                }
+            } else if self.buf.as_bytes()[p] == b'"' || self.buf.as_bytes()[p] == b'\'' {
+                let mut sb = String::new();
+                let r = match self
+                    .scan_quoted_literal_with_char_refs_bytes(p, &mut sb, false, pending)?
+                {
+                    None => return Ok(None),
+                    Some(r) => r,
+                };
+                p = r;
+                raw_default = Some(sb);
+                mode = Mode::None;
+            } else {
+                return Err(self.fatal("Malformed attribute-list declaration"));
+            }
+
+            if let Some(raw) = &raw_default {
+                let raw = raw.clone();
+                self.check_attlist_default_entities_declared(&raw, pending)?;
+            }
+            if self.validation_enabled {
+                self.check_attlist_declaration_vcs(&element_name, &attr_name, &ty, mode)?;
+            }
+            let declared = self.dtd_model.declare_attribute(
+                &element_name,
+                &attr_name,
+                &ty,
+                mode,
+                raw_default.clone(),
+                enumeration.clone(),
+                self.parsing_external_content,
+            );
+            if declared {
+                let type_str = format_attribute_decl_type(&ty, enumeration.as_ref());
+                let mode_str = format_attribute_decl_mode(mode);
+                self.handler.attribute_decl(
+                    &element_name,
+                    &attr_name,
+                    &type_str,
+                    mode_str.unwrap_or(""),
+                    raw_default.as_deref(),
+                )?;
+            }
+        }
+    }
+
     // ===== DOCTYPE =====
 
     fn scan_doctype(&mut self, tag_start: usize) -> ParseResult<bool> {
@@ -3258,6 +6205,122 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_doctype` — the top of the DOCTYPE dispatch tree, tying
+    /// together every byte-native DTD primitive built so far. Reuses
+    /// `finish_doctype_external_subset` unchanged: it (via
+    /// `parse_external_subset`) always parses fetched external-subset
+    /// content through its own temporary `Vec<char>` swap, regardless of
+    /// what representation the live scanner is in, so it never touches
+    /// `self.buf`'s outer state either way.
+    #[allow(dead_code)]
+    fn scan_doctype_bytes(&mut self, tag_start: usize) -> ParseResult<bool> {
+        match self.match_keyword_bytes(tag_start, DOCTYPE_MARKER) {
+            KwResult::NeedMore => {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+            KwResult::NoMatch => return Err(self.fatal("Malformed markup declaration")),
+            KwResult::Match => {}
+        }
+        if self.root_started {
+            return Err(self.fatal("DOCTYPE declaration must precede the root element"));
+        }
+        if self.doctype_seen {
+            return Err(self.fatal("Only one DOCTYPE declaration is allowed"));
+        }
+        if matches!(self.settings.doctype_handling, DoctypeHandling::Disallow) {
+            return Err(self.fatal(
+                "DOCTYPE is disallowed when the feature \"http://apache.org/xml/features/disallow-doctype-decl\" is set to true",
+            ));
+        }
+
+        let mut p = tag_start + DOCTYPE_MARKER.len();
+        let ws = p;
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+        if p == ws {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        let name_start = p;
+        p = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+            NameScanBytes::Illegal => return Err(self.fatal("Malformed DOCTYPE declaration")),
+            NameScanBytes::End(p) => p,
+        };
+        if p == name_start {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name = self.slice_bytes(name_start, p);
+
+        p = self.skip_optional_whitespace_bytes(p);
+        if p >= self.limit {
+            self.pos = tag_start;
+            return Ok(false);
+        }
+
+        if self.buf.as_bytes()[p] == b'S' || self.buf.as_bytes()[p] == b'P' {
+            let r = match self.skip_external_id_bytes(p)? {
+                None => {
+                    self.pos = tag_start;
+                    return Ok(false);
+                }
+                Some(r) => r,
+            };
+            self.doctype_external_public_id = self.last_external_id_public_id.clone();
+            self.doctype_external_system_id = self.last_external_id_system_id.clone();
+            self.doctype_public_id = self.last_external_id_public_id.clone();
+            self.doctype_system_id = self.last_external_id_system_id.clone();
+            p = r;
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit {
+                self.pos = tag_start;
+                return Ok(false);
+            }
+        }
+
+        if self.buf.as_bytes()[p] == b'[' {
+            let pub_id = self.doctype_external_public_id.clone();
+            let sys_id = self.doctype_external_system_id.clone();
+            self.handler.start_dtd(&name, pub_id.as_deref(), sys_id.as_deref())?;
+            self.doctype_name_pending = Some(name);
+            self.pos = p + 1;
+            self.in_doctype = true;
+            let finished = if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
+                self.skip_doctype_subset_inner_bytes()?
+            } else {
+                self.doctype_pending = Some(PendingDecls::default());
+                self.scan_doctype_subset_bytes()?
+            };
+            if !finished {
+                return Ok(false);
+            }
+            self.in_doctype = false;
+            return Ok(true);
+        }
+
+        if self.buf.as_bytes()[p] != b'>' {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        p += 1;
+        self.pos = p;
+        let pub_id = self.doctype_external_public_id.clone();
+        let sys_id = self.doctype_external_system_id.clone();
+        self.handler.start_dtd(&name, pub_id.as_deref(), sys_id.as_deref())?;
+        self.finish_doctype_external_subset_bytes(&name)?;
+        self.handler.end_dtd()?;
+        self.doctype_seen = true;
+        self.doctype_name = Some(name);
+        Ok(true)
+    }
+
     fn finish_doctype_external_subset(&mut self, root_name: &str) -> ParseResult<()> {
         if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
             // Never fetch or parse an external subset in Skip mode,
@@ -3278,6 +6341,49 @@ impl<'a> Scanner<'a> {
                 let saved_base = self.base_system_id.clone();
                 self.base_system_id = self.last_resolved_system_id.clone();
                 let result = self.parse_external_subset(&chars);
+                self.base_system_id = saved_base;
+                result?;
+            }
+            self.handler.end_entity("[dtd]")?;
+        }
+        self.doctype_external_public_id = None;
+        self.doctype_external_system_id = None;
+        self.resolve_attlist_defaults_against_entities()?;
+        if self.validation_enabled {
+            self.check_attlist_defaults_legal()?;
+        }
+        Ok(())
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `finish_doctype_external_subset`. `fetch_external_resource`,
+    /// `resolve_attlist_defaults_against_entities`, and
+    /// `check_attlist_defaults_legal` are reused unchanged (none touch
+    /// `self.buf`); only the `parse_external_subset` call needed a
+    /// byte-native counterpart, for the reason documented on
+    /// `parse_external_subset_bytes`.
+    #[allow(dead_code)]
+    fn finish_doctype_external_subset_bytes(&mut self, root_name: &str) -> ParseResult<()> {
+        if matches!(self.settings.doctype_handling, DoctypeHandling::Skip) {
+            self.doctype_external_public_id = None;
+            self.doctype_external_system_id = None;
+            return Ok(());
+        }
+        if self.doctype_external_system_id.is_some() {
+            self.handler.start_entity("[dtd]")?;
+            if self.settings.external_parameter_entities {
+                let what = format!("the external DTD subset for \"{root_name}\"");
+                let public_id = self.doctype_external_public_id.clone();
+                let system_id = self.doctype_external_system_id.clone();
+                let chars = self.fetch_external_resource(
+                    "[dtd]",
+                    &what,
+                    public_id.as_deref(),
+                    system_id.as_deref(),
+                )?;
+                let saved_base = self.base_system_id.clone();
+                self.base_system_id = self.last_resolved_system_id.clone();
+                let result = self.parse_external_subset_bytes(&chars);
                 self.base_system_id = saved_base;
                 result?;
             }
@@ -3449,6 +6555,187 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_doctype_subset`.
+    #[allow(dead_code)]
+    fn scan_doctype_subset_bytes(&mut self) -> ParseResult<bool> {
+        let mut pending = self.doctype_pending.take().unwrap_or_default();
+        let result = self.scan_doctype_subset_inner_bytes(&mut pending);
+        self.doctype_pending = Some(pending);
+        result
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `scan_doctype_subset_inner` — the internal-subset streaming
+    /// dispatch loop, resumable across `receive()` calls (unlike
+    /// `parse_markup_decl_seq_bytes`, which assumes its input is already
+    /// fully buffered). A 1:1 structural port dispatching to every
+    /// byte-native declaration/comment/PI scanner built so far, plus
+    /// `expand_parameter_entity_reference_bytes` for `%` references used
+    /// as declaration separators.
+    #[allow(dead_code)]
+    fn scan_doctype_subset_inner_bytes(&mut self, pending: &mut PendingDecls) -> ParseResult<bool> {
+        if !self.doctype_subset_closed {
+            loop {
+                if self.in_pi {
+                    if !self.scan_pi_data_bytes()? {
+                        return Ok(false);
+                    }
+                    self.in_pi = false;
+                    continue;
+                }
+                if self.in_comment {
+                    if !self.scan_comment_data_bytes()? {
+                        return Ok(false);
+                    }
+                    self.in_comment = false;
+                    continue;
+                }
+                self.pos = self.skip_optional_whitespace_bytes(self.pos);
+                if self.pos >= self.limit {
+                    return Ok(false);
+                }
+                let c = self.buf.as_bytes()[self.pos];
+                if c == b']' {
+                    self.pos += 1;
+                    self.doctype_subset_closed = true;
+                    break;
+                }
+                if c == b'%' {
+                    let q = match self.scan_name_chars_bytes(self.pos + 1) {
+                        NameScanBytes::NeedMore => return Ok(false),
+                        NameScanBytes::Illegal => {
+                            return Err(self.fatal("Malformed parameter entity reference"));
+                        }
+                        NameScanBytes::End(q) => q,
+                    };
+                    if q >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf.as_bytes()[q] != b';' {
+                        return Err(self.fatal("Malformed parameter entity reference"));
+                    }
+                    self.expand_parameter_entity_reference_bytes(pending)?;
+                    continue;
+                }
+                if c != b'<' {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+                if self.pos + 1 >= self.limit {
+                    return Ok(false);
+                }
+                let c2 = self.buf.as_bytes()[self.pos + 1];
+                if c2 == b'?' {
+                    if !self.scan_pi_bytes(self.pos)? {
+                        return Ok(false);
+                    }
+                } else if c2 == b'!' {
+                    if self.pos + 2 >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf.as_bytes()[self.pos + 2] == b'-' {
+                        if !self.scan_comment_bytes(self.pos)? {
+                            return Ok(false);
+                        }
+                    } else {
+                        match self.match_keyword_bytes(self.pos, ENTITY_MARKER) {
+                            KwResult::NeedMore => return Ok(false),
+                            KwResult::Match => {
+                                let start = self.pos + ENTITY_MARKER.len();
+                                match self.scan_entity_declaration_bytes(start, pending)? {
+                                    None => return Ok(false),
+                                    Some(r) => self.pos = r,
+                                }
+                            }
+                            KwResult::NoMatch => {
+                                match self.match_keyword_bytes(self.pos, ATTLIST_MARKER) {
+                                    KwResult::NeedMore => return Ok(false),
+                                    KwResult::Match => {
+                                        let start = self.pos + ATTLIST_MARKER.len();
+                                        match self.scan_attlist_declaration_bytes(start, pending)?
+                                        {
+                                            None => return Ok(false),
+                                            Some(r) => self.pos = r,
+                                        }
+                                    }
+                                    KwResult::NoMatch => {
+                                        match self.match_keyword_bytes(self.pos, ELEMENT_MARKER) {
+                                            KwResult::NeedMore => return Ok(false),
+                                            KwResult::Match => {
+                                                let start = self.pos + ELEMENT_MARKER.len();
+                                                match self
+                                                    .scan_element_declaration_bytes(start, pending)?
+                                                {
+                                                    None => return Ok(false),
+                                                    Some(r) => self.pos = r,
+                                                }
+                                            }
+                                            KwResult::NoMatch => {
+                                                match self
+                                                    .match_keyword_bytes(self.pos, NOTATION_MARKER)
+                                                {
+                                                    KwResult::NeedMore => return Ok(false),
+                                                    KwResult::NoMatch => {
+                                                        return Err(self.fatal("Expected an element, attribute-list, entity, or notation declaration"))
+                                                    }
+                                                    KwResult::Match => {
+                                                        let start =
+                                                            self.pos + NOTATION_MARKER.len();
+                                                        match self
+                                                            .scan_notation_declaration_bytes(start)?
+                                                        {
+                                                            None => return Ok(false),
+                                                            Some(r) => self.pos = r,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+            }
+        }
+
+        self.pos = self.skip_optional_whitespace_bytes(self.pos);
+        if self.pos >= self.limit {
+            return Ok(false);
+        }
+        if self.buf.as_bytes()[self.pos] != b'>' {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        self.pos += 1;
+
+        // Merge pending into scanner-wide maps.
+        for (k, v) in pending.entities.drain() {
+            self.general_entities.entry(k).or_insert(v);
+        }
+        let external_snapshot: HashMap<String, ExtEntity> = pending.external_names.clone();
+        for (k, v) in pending.external_names.drain() {
+            self.external_entity_names.entry(k).or_insert(v);
+        }
+        self.report_unparsed_entities(&external_snapshot)?;
+        for (k, v) in pending.param_entities.drain() {
+            self.parameter_entities.entry(k).or_insert(v);
+        }
+        for (k, v) in pending.param_external_names.drain() {
+            self.parameter_entity_external_ids.entry(k).or_insert(v);
+        }
+        let name_pending = self.doctype_name_pending.clone().unwrap_or_default();
+        self.finish_doctype_external_subset_bytes(&name_pending)?;
+        self.handler.end_dtd()?;
+        self.doctype_seen = true;
+        self.doctype_name = self.doctype_name_pending.take();
+        self.doctype_name_pending = None;
+        self.doctype_subset_closed = false;
+        Ok(true)
+    }
+
     /// `DoctypeHandling::Skip`'s counterpart to `scan_doctype_subset_inner`:
     /// recognizes the internal subset well enough to find where it ends
     /// (bracket/quote/comment/PI-aware) without parsing any declaration's
@@ -3558,6 +6845,119 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_doctype_subset_inner`. `DoctypeHandling::Skip`'s dispatch loop
+    /// -- recognizes the internal subset well enough to find where it ends
+    /// without parsing any declaration's contents, so it never needs the
+    /// declaration scanners, only the byte-native comment/PI scanners plus
+    /// `skip_declaration_body_bytes`.
+    #[allow(dead_code)]
+    fn skip_doctype_subset_inner_bytes(&mut self) -> ParseResult<bool> {
+        if !self.doctype_subset_closed {
+            loop {
+                if self.in_pi {
+                    if !self.scan_pi_data_bytes()? {
+                        return Ok(false);
+                    }
+                    self.in_pi = false;
+                    continue;
+                }
+                if self.in_comment {
+                    if !self.scan_comment_data_bytes()? {
+                        return Ok(false);
+                    }
+                    self.in_comment = false;
+                    continue;
+                }
+                if self.in_skipped_declaration {
+                    if !self.skip_declaration_body_bytes()? {
+                        return Ok(false);
+                    }
+                    self.in_skipped_declaration = false;
+                    continue;
+                }
+                self.pos = self.skip_optional_whitespace_bytes(self.pos);
+                if self.pos >= self.limit {
+                    return Ok(false);
+                }
+                let c = self.buf.as_bytes()[self.pos];
+                if c == b']' {
+                    self.pos += 1;
+                    self.doctype_subset_closed = true;
+                    break;
+                }
+                if c == b'%' {
+                    // A parameter entity reference used as a declaration
+                    // separator — skip the token itself, don't resolve it.
+                    let q = match self.scan_name_chars_bytes(self.pos + 1) {
+                        NameScanBytes::NeedMore => return Ok(false),
+                        NameScanBytes::Illegal => {
+                            return Err(self.fatal("Malformed parameter entity reference"));
+                        }
+                        NameScanBytes::End(q) => q,
+                    };
+                    if q >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf.as_bytes()[q] != b';' {
+                        return Err(self.fatal("Malformed parameter entity reference"));
+                    }
+                    self.pos = q + 1;
+                    continue;
+                }
+                if c != b'<' {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+                if self.pos + 1 >= self.limit {
+                    return Ok(false);
+                }
+                let c2 = self.buf.as_bytes()[self.pos + 1];
+                if c2 == b'?' {
+                    if !self.scan_pi_bytes(self.pos)? {
+                        return Ok(false);
+                    }
+                } else if c2 == b'!' {
+                    if self.pos + 2 >= self.limit {
+                        return Ok(false);
+                    }
+                    if self.buf.as_bytes()[self.pos + 2] == b'-' {
+                        if !self.scan_comment_bytes(self.pos)? {
+                            return Ok(false);
+                        }
+                    } else {
+                        // <!ELEMENT / <!ATTLIST / <!ENTITY / <!NOTATION —
+                        // skip to the first unquoted '>'. Uniform across
+                        // all four (not distinguishing which one matched)
+                        // is strictly safe and simpler.
+                        self.pos += 2;
+                        self.in_skipped_declaration = true;
+                        self.skip_decl_quote = None;
+                    }
+                } else {
+                    return Err(self.fatal("Malformed internal DTD subset"));
+                }
+            }
+        }
+
+        self.pos = self.skip_optional_whitespace_bytes(self.pos);
+        if self.pos >= self.limit {
+            return Ok(false);
+        }
+        if self.buf.as_bytes()[self.pos] != b'>' {
+            return Err(self.fatal("Malformed DOCTYPE declaration"));
+        }
+        self.pos += 1;
+
+        let name_pending = self.doctype_name_pending.clone().unwrap_or_default();
+        self.finish_doctype_external_subset_bytes(&name_pending)?;
+        self.handler.end_dtd()?;
+        self.doctype_seen = true;
+        self.doctype_name = self.doctype_name_pending.take();
+        self.doctype_name_pending = None;
+        self.doctype_subset_closed = false;
+        Ok(true)
+    }
+
     /// Advances past a skipped `<!...>` declaration's body to its first
     /// unquoted `>`, tracking `self.skip_decl_quote` so a `>` or `]` inside
     /// a quoted default/literal value doesn't end the declaration early.
@@ -3581,6 +6981,42 @@ impl<'a> Scanner<'a> {
                     self.pos += 1;
                 }
                 '>' => {
+                    self.pos += 1;
+                    return Ok(true);
+                }
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_declaration_body`. Never interprets a skipped byte as a
+    /// character (only compares against the ASCII quote/`>` bytes), so
+    /// walking one raw byte at a time through a multi-byte sequence's
+    /// non-marker bytes is exactly equivalent, same reasoning as
+    /// `skip_ignored_section_bytes`.
+    #[allow(dead_code)]
+    fn skip_declaration_body_bytes(&mut self) -> ParseResult<bool> {
+        loop {
+            if self.pos >= self.limit {
+                return Ok(false);
+            }
+            let c = self.buf.as_bytes()[self.pos];
+            if let Some(q) = self.skip_decl_quote {
+                self.pos += 1;
+                if c == q as u8 {
+                    self.skip_decl_quote = None;
+                }
+                continue;
+            }
+            match c {
+                b'\'' | b'"' => {
+                    self.skip_decl_quote = Some(c as char);
+                    self.pos += 1;
+                }
+                b'>' => {
                     self.pos += 1;
                     return Ok(true);
                 }
@@ -3676,7 +7112,7 @@ impl<'a> Scanner<'a> {
         }
 
         self.entity_expansion_stack.push(name.to_string());
-        let saved_buf = std::mem::replace(&mut self.buf, replacement_chars);
+        let saved_buf = std::mem::replace(self.buf.as_chars_mut(), replacement_chars);
         let saved_pos = self.pos;
         let saved_limit = self.limit;
         let saved_content_run_open = self.content_run_open;
@@ -3684,7 +7120,7 @@ impl<'a> Scanner<'a> {
         let stack_depth_at_entry = self.element_stack.len();
 
         self.pos = 0;
-        self.limit = self.buf.len();
+        self.limit = self.buf.as_chars().len();
         self.content_run_open = false;
         self.allow_restricted_char_in_content = self.restricted_char_entities.contains(name);
         self.entity_stack_floors.push(stack_depth_at_entry);
@@ -3718,7 +7154,92 @@ impl<'a> Scanner<'a> {
             Ok(())
         })();
 
-        self.buf = saved_buf;
+        *self.buf.as_chars_mut() = saved_buf;
+        self.pos = saved_pos;
+        self.limit = saved_limit;
+        self.content_run_open = saved_content_run_open;
+        self.allow_restricted_char_in_content = saved_allow_restricted;
+        self.entity_expansion_stack.pop();
+        self.entity_stack_floors.pop();
+
+        final_result
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `expand_general_entity_in_content`. `fetch_external_entity`/
+    /// `strip_declaration` are reused unchanged (neither touches
+    /// `self.buf`); the replacement text is re-encoded to UTF-8 once
+    /// before swapping it in, and the recursive parse goes through
+    /// `scan_bytes` (the byte-native top-level dispatch loop) instead of
+    /// `scan` — general entity replacement text in content can contain
+    /// arbitrary well-formed markup (tags, comments, PIs, nested entity
+    /// refs), unlike a parameter entity's replacement text in the DTD.
+    #[allow(dead_code)]
+    fn expand_general_entity_in_content_bytes(&mut self, name: &str) -> ParseResult<()> {
+        if !self.check_entity_referenceable(name, true)? {
+            return Ok(());
+        }
+        let external = self.external_entity_names.get(name).cloned();
+        self.handler.start_entity(name)?;
+        let replacement_chars: Vec<char>;
+        if let Some(ext) = external {
+            if !self.settings.external_general_entities {
+                self.handler.end_entity(name)?;
+                return Ok(());
+            }
+            let fetched =
+                self.fetch_external_entity(name, ext.public_id.as_deref(), ext.system_id.as_deref())?;
+            replacement_chars = self.strip_declaration(&fetched)?;
+        } else {
+            replacement_chars = self.general_entities.get(name).unwrap().to_vec();
+        }
+
+        self.entity_expansion_stack.push(name.to_string());
+        let encoded: String = replacement_chars.iter().collect();
+        let saved_buf =
+            std::mem::replace(self.buf.as_bytes_mut(), BytesMut::from(encoded.as_bytes()));
+        let saved_pos = self.pos;
+        let saved_limit = self.limit;
+        let saved_content_run_open = self.content_run_open;
+        let saved_allow_restricted = self.allow_restricted_char_in_content;
+        let stack_depth_at_entry = self.element_stack.len();
+
+        self.pos = 0;
+        self.limit = self.buf.as_bytes().len();
+        self.content_run_open = false;
+        self.allow_restricted_char_in_content = self.restricted_char_entities.contains(name);
+        self.entity_stack_floors.push(stack_depth_at_entry);
+
+        let scan_result = self.scan_bytes();
+
+        let final_result = (|| -> ParseResult<()> {
+            scan_result?;
+            if self.pos != self.limit
+                || self.in_start_tag
+                || self.in_attribute_value
+                || self.in_pi
+                || self.in_comment
+                || self.in_cdata
+                || self.in_doctype
+            {
+                let msg = format!("Entity \"{name}\" replacement text is not well-formed");
+                return Err(self.fatal(&msg));
+            }
+            if self.element_stack.len() != stack_depth_at_entry {
+                let msg = format!(
+                    "Well-Formedness Constraint: Parsed Entity (Section 4.1). Entity \"{name}\" replacement text is not well-formed: element boundaries must nest within entity boundaries"
+                );
+                return Err(self.fatal(&msg));
+            }
+            if self.content_run_open {
+                let ws = self.content_run_is_whitespace;
+                self.emit_content_empty(true, ws)?;
+            }
+            self.handler.end_entity(name)?;
+            Ok(())
+        })();
+
+        *self.buf.as_bytes_mut() = saved_buf;
         self.pos = saved_pos;
         self.limit = saved_limit;
         self.content_run_open = saved_content_run_open;
@@ -3961,12 +7482,12 @@ impl<'a> Scanner<'a> {
         let chars = self.strip_declaration(raw_chars)?;
         let mut pending = PendingDecls::default();
 
-        let saved_buf = std::mem::replace(&mut self.buf, chars);
+        let saved_buf = std::mem::replace(self.buf.as_chars_mut(), chars);
         let saved_pos = self.pos;
         let saved_limit = self.limit;
         let saved_parsing = self.parsing_external_content;
         self.pos = 0;
-        self.limit = self.buf.len();
+        self.limit = self.buf.as_chars().len();
         self.parsing_external_content = true;
 
         let result = self.parse_markup_decl_seq(false, false, &mut pending);
@@ -3977,7 +7498,54 @@ impl<'a> Scanner<'a> {
             Ok(())
         };
 
-        self.buf = saved_buf;
+        *self.buf.as_chars_mut() = saved_buf;
+        self.pos = saved_pos;
+        self.limit = saved_limit;
+        self.parsing_external_content = saved_parsing;
+
+        result?;
+        commit_result
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `parse_external_subset`. The fetched content is always `Vec<char>`
+    /// (straight out of `fetch_external_resource`'s own decode step,
+    /// independent of the live scanner's representation), so it's
+    /// re-encoded to UTF-8 once before swapping it in as `self.buf`'s
+    /// temporary content -- same swap-parse-restore shape as
+    /// `expand_parameter_entity_reference_bytes`, over `parse_markup_decl_seq_bytes`
+    /// instead of the char version.
+    ///
+    /// This function exists because `parse_external_subset` itself
+    /// unconditionally swaps `self.buf.as_chars_mut()`, which panics if
+    /// the live scanner is currently in byte mode -- unlike every other
+    /// "operates on its own data, never touches self.buf" function found
+    /// so far in this exploration, this one genuinely reaches into
+    /// `self.buf`'s outer representation.
+    #[allow(dead_code)]
+    fn parse_external_subset_bytes(&mut self, raw_chars: &[char]) -> ParseResult<()> {
+        let chars = self.strip_declaration(raw_chars)?;
+        let mut pending = PendingDecls::default();
+
+        let encoded: String = chars.iter().collect();
+        let saved_buf =
+            std::mem::replace(self.buf.as_bytes_mut(), BytesMut::from(encoded.as_bytes()));
+        let saved_pos = self.pos;
+        let saved_limit = self.limit;
+        let saved_parsing = self.parsing_external_content;
+        self.pos = 0;
+        self.limit = self.buf.as_bytes().len();
+        self.parsing_external_content = true;
+
+        let result = self.parse_markup_decl_seq_bytes(false, false, &mut pending);
+
+        let commit_result = if result.is_ok() {
+            self.commit_external_subset(&mut pending)
+        } else {
+            Ok(())
+        };
+
+        *self.buf.as_bytes_mut() = saved_buf;
         self.pos = saved_pos;
         self.limit = saved_limit;
         self.parsing_external_content = saved_parsing;
@@ -4130,6 +7698,125 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `parse_markup_decl_seq`. Used by `expand_parameter_entity_reference_bytes`
+    /// to parse a parameter entity's replacement text as a standalone
+    /// declaration sequence (the rare "PE reference used as a declaration
+    /// separator, expanding to one or more full declarations" case) — a
+    /// 1:1 structural port dispatching to every byte-native declaration
+    /// scanner built so far, plus `parse_conditional_section_bytes` for
+    /// nested `INCLUDE`/`IGNORE` sections.
+    #[allow(dead_code)]
+    fn parse_markup_decl_seq_bytes(
+        &mut self,
+        stop_at_section_end: bool,
+        section_opener_from_splice: bool,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<()> {
+        loop {
+            self.pos = self.skip_optional_whitespace_bytes(self.pos);
+            if stop_at_section_end
+                && self.pos + 2 < self.limit
+                && self.buf.as_bytes()[self.pos] == b']'
+                && self.buf.as_bytes()[self.pos + 1] == b']'
+                && self.buf.as_bytes()[self.pos + 2] == b'>'
+            {
+                if ((self.pos as i64) < self.last_splice_end) != section_opener_from_splice {
+                    self.handler.error(
+                        "Validity Constraint: Proper Conditional Section/PE Nesting (Section 3.4). A conditional section's opening and closing delimiters must be contained in the same parameter entity replacement text (or both be literal).",
+                    )?;
+                }
+                self.pos += 3;
+                return Ok(());
+            }
+            if self.pos >= self.limit {
+                if stop_at_section_end {
+                    return Err(self.fatal("Unterminated INCLUDE conditional section"));
+                }
+                return Ok(());
+            }
+            let c = self.buf.as_bytes()[self.pos];
+            if c == b'%' {
+                self.expand_parameter_entity_reference_bytes(pending)?;
+                continue;
+            }
+            if c != b'<' || self.pos + 1 >= self.limit {
+                return Err(self.fatal("Malformed markup declaration"));
+            }
+            let c2 = self.buf.as_bytes()[self.pos + 1];
+            if c2 == b'?' {
+                if !self.scan_pi_bytes(self.pos)? {
+                    return Err(self.fatal("Malformed processing instruction"));
+                }
+            } else if c2 == b'!' {
+                if self.pos + 2 >= self.limit {
+                    return Err(self.fatal("Malformed markup declaration"));
+                }
+                if self.buf.as_bytes()[self.pos + 2] == b'-' {
+                    if !self.scan_comment_bytes(self.pos)? {
+                        return Err(self.fatal("Malformed comment"));
+                    }
+                } else if self.buf.as_bytes()[self.pos + 2] == b'[' {
+                    self.parse_conditional_section_bytes(pending)?;
+                } else {
+                    match self.match_keyword_bytes(self.pos, ENTITY_MARKER) {
+                        KwResult::Match => {
+                            let start = self.pos + ENTITY_MARKER.len();
+                            match self.scan_entity_declaration_bytes(start, pending)? {
+                                None => return Err(self.fatal("Malformed entity declaration")),
+                                Some(r) => self.pos = r,
+                            }
+                        }
+                        _ => match self.match_keyword_bytes(self.pos, ATTLIST_MARKER) {
+                            KwResult::Match => {
+                                let start = self.pos + ATTLIST_MARKER.len();
+                                match self.scan_attlist_declaration_bytes(start, pending)? {
+                                    None => {
+                                        return Err(
+                                            self.fatal("Malformed attribute-list declaration")
+                                        )
+                                    }
+                                    Some(r) => self.pos = r,
+                                }
+                            }
+                            _ => match self.match_keyword_bytes(self.pos, ELEMENT_MARKER) {
+                                KwResult::Match => {
+                                    let start = self.pos + ELEMENT_MARKER.len();
+                                    match self.scan_element_declaration_bytes(start, pending)? {
+                                        None => {
+                                            return Err(
+                                                self.fatal("Malformed element declaration")
+                                            )
+                                        }
+                                        Some(r) => self.pos = r,
+                                    }
+                                }
+                                _ => match self.match_keyword_bytes(self.pos, NOTATION_MARKER) {
+                                    KwResult::Match => {
+                                        let start = self.pos + NOTATION_MARKER.len();
+                                        match self.scan_notation_declaration_bytes(start)? {
+                                            None => {
+                                                return Err(
+                                                    self.fatal("Malformed notation declaration")
+                                                )
+                                            }
+                                            Some(r) => self.pos = r,
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(self.fatal("Expected an element, attribute-list, entity, or notation declaration"))
+                                    }
+                                },
+                            },
+                        },
+                    }
+                }
+            } else {
+                return Err(self.fatal("Malformed markup declaration"));
+            }
+        }
+    }
+
     fn parse_conditional_section(&mut self, pending: &mut PendingDecls) -> ParseResult<()> {
         self.pos += 3; // "<!["
         self.pos = self.skip_whitespace_in_declaration(self.pos, pending, false)?;
@@ -4165,6 +7852,44 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `parse_conditional_section`.
+    #[allow(dead_code)]
+    fn parse_conditional_section_bytes(&mut self, pending: &mut PendingDecls) -> ParseResult<()> {
+        self.pos += 3; // "<!["
+        self.pos = self.skip_whitespace_in_declaration_bytes(self.pos, pending, false)?;
+        let include;
+        match self.match_keyword_bytes(self.pos, INCLUDE_MARKER) {
+            KwResult::Match => {
+                include = true;
+                self.pos += INCLUDE_MARKER.len();
+            }
+            _ => match self.match_keyword_bytes(self.pos, IGNORE_MARKER) {
+                KwResult::Match => {
+                    include = false;
+                    self.pos += IGNORE_MARKER.len();
+                }
+                _ => {
+                    return Err(
+                        self.fatal("Malformed conditional section: expected INCLUDE or IGNORE")
+                    )
+                }
+            },
+        }
+        self.pos = self.skip_optional_whitespace_bytes(self.pos);
+        if self.pos >= self.limit || self.buf.as_bytes()[self.pos] != b'[' {
+            return Err(self.fatal("Malformed conditional section"));
+        }
+        let opener_from_splice = (self.pos as i64) < self.last_splice_end;
+        self.pos += 1;
+        if include {
+            self.parse_markup_decl_seq_bytes(true, opener_from_splice, pending)?;
+        } else {
+            self.skip_ignored_section_bytes()?;
+        }
+        Ok(())
+    }
+
     fn skip_ignored_section(&mut self) -> ParseResult<()> {
         let mut depth = 1;
         while depth > 0 {
@@ -4179,6 +7904,39 @@ impl<'a> Scanner<'a> {
                 && self.buf[self.pos] == ']'
                 && self.buf[self.pos + 1] == ']'
                 && self.buf[self.pos + 2] == '>'
+            {
+                depth -= 1;
+                self.pos += 3;
+            } else if self.pos < self.limit {
+                self.pos += 1;
+            } else {
+                return Err(self.fatal("Unterminated IGNORE conditional section"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_ignored_section`. Never interprets a skipped byte as a
+    /// character (the char path doesn't either — it only ever compares
+    /// against the three ASCII marker bytes), so walking one raw byte at a
+    /// time through a multi-byte sequence's non-marker bytes is exactly
+    /// equivalent, no decoding needed at all.
+    #[allow(dead_code)]
+    fn skip_ignored_section_bytes(&mut self) -> ParseResult<()> {
+        let mut depth = 1;
+        while depth > 0 {
+            if self.pos + 2 < self.limit
+                && self.buf.as_bytes()[self.pos] == b'<'
+                && self.buf.as_bytes()[self.pos + 1] == b'!'
+                && self.buf.as_bytes()[self.pos + 2] == b'['
+            {
+                depth += 1;
+                self.pos += 3;
+            } else if self.pos + 2 < self.limit
+                && self.buf.as_bytes()[self.pos] == b']'
+                && self.buf.as_bytes()[self.pos + 1] == b']'
+                && self.buf.as_bytes()[self.pos + 2] == b'>'
             {
                 depth -= 1;
                 self.pos += 3;
@@ -4225,13 +7983,13 @@ impl<'a> Scanner<'a> {
         // self.buf must be a uniquely-owned Vec<char> (the recursive parse
         // below writes into it, including further splices) — this copy is
         // a plain slice memcpy from the shared Rc, not a UTF-8 re-decode.
-        let saved_buf = std::mem::replace(&mut self.buf, replacement_chars.to_vec());
+        let saved_buf = std::mem::replace(self.buf.as_chars_mut(), replacement_chars.to_vec());
         let saved_pos = self.pos;
         let saved_limit = self.limit;
         let saved_parsing = self.parsing_external_content;
         let saved_base = self.base_system_id.clone();
         self.pos = 0;
-        self.limit = self.buf.len();
+        self.limit = self.buf.as_chars().len();
         if self.last_param_entity_was_external {
             self.parsing_external_content = true;
             self.base_system_id = self.last_resolved_system_id.clone();
@@ -4246,7 +8004,86 @@ impl<'a> Scanner<'a> {
             Ok(())
         })();
 
-        self.buf = saved_buf;
+        *self.buf.as_chars_mut() = saved_buf;
+        self.pos = saved_pos;
+        self.limit = saved_limit;
+        self.parsing_external_content = saved_parsing;
+        self.base_system_id = saved_base;
+        self.parameter_entity_expansion_stack.pop();
+        result?;
+        self.pos = resume_at;
+        Ok(())
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `expand_parameter_entity_reference`. `resolve_parameter_entity_replacement`
+    /// still returns `Rc<[char]>` (entity replacement text is resolved
+    /// once and cached that way regardless of which path is scanning), so
+    /// the one representation-dependent step is re-encoding it to UTF-8
+    /// before swapping it in as `self.buf`'s temporary content — the same
+    /// swap-parse-restore shape as the char path, just over a `BytesMut`
+    /// instead of a `Vec<char>`.
+    #[allow(dead_code)]
+    fn expand_parameter_entity_reference_bytes(
+        &mut self,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<()> {
+        let name_start = self.pos + 1;
+        let q = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore | NameScanBytes::Illegal => {
+                return Err(self.fatal("Malformed parameter entity reference"));
+            }
+            NameScanBytes::End(q) => q,
+        };
+        if q >= self.limit || self.buf.as_bytes()[q] != b';' {
+            return Err(self.fatal("Malformed parameter entity reference"));
+        }
+        if q == name_start {
+            return Err(self.fatal("Malformed parameter entity reference"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        let name = self.slice_bytes(name_start, q);
+        let resume_at = q + 1;
+
+        if !self.parsing_external_content {
+            self.saw_internal_subset_parameter_entity_reference = true;
+        }
+        let replacement_chars = match self.resolve_parameter_entity_replacement(&name, pending)? {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        if self.parameter_entity_expansion_stack.contains(&name) {
+            let msg = format!("Recursive parameter entity reference: %{name};");
+            return Err(self.fatal(&msg));
+        }
+        self.check_entity_expansion_limit(replacement_chars.len() as i64)?;
+        self.parameter_entity_expansion_stack.push(name.clone());
+
+        let encoded: String = replacement_chars.iter().collect();
+        let saved_buf =
+            std::mem::replace(self.buf.as_bytes_mut(), BytesMut::from(encoded.as_bytes()));
+        let saved_pos = self.pos;
+        let saved_limit = self.limit;
+        let saved_parsing = self.parsing_external_content;
+        let saved_base = self.base_system_id.clone();
+        self.pos = 0;
+        self.limit = self.buf.as_bytes().len();
+        if self.last_param_entity_was_external {
+            self.parsing_external_content = true;
+            self.base_system_id = self.last_resolved_system_id.clone();
+        }
+
+        let result = (|| -> ParseResult<()> {
+            self.parse_markup_decl_seq_bytes(false, false, pending)?;
+            if self.pos != self.limit {
+                let msg = format!("Parameter entity \"{name}\" replacement text is not well-formed");
+                return Err(self.fatal(&msg));
+            }
+            Ok(())
+        })();
+
+        *self.buf.as_bytes_mut() = saved_buf;
         self.pos = saved_pos;
         self.limit = saved_limit;
         self.parsing_external_content = saved_parsing;
@@ -4323,12 +8160,12 @@ impl<'a> Scanner<'a> {
         let delta = new_span as i64 - old_span as i64;
         if delta > 0 {
             let needed = (self.limit as i64 + delta) as usize;
-            if needed > self.buf.len() {
-                let mut newcap = self.buf.len() * 2;
+            if needed > self.buf.as_chars().len() {
+                let mut newcap = self.buf.as_chars().len() * 2;
                 while newcap < needed {
                     newcap *= 2;
                 }
-                self.buf.resize(newcap, '\u{0}');
+                self.buf.as_chars_mut().resize(newcap, '\u{0}');
             }
         }
         // Move tail.
@@ -4371,6 +8208,78 @@ impl<'a> Scanner<'a> {
         }
         let end = self.last_pe_reference_end;
         Ok(self.splice_into_buf(p, end, &replacement_chars))
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `splice_into_buf`. The one genuinely representation-dependent step
+    /// in the whole PE-splicing subsystem: `replacement` (always `[char]`,
+    /// since entity replacement text is resolved once at declaration time
+    /// and cached that way regardless of which path is scanning) has to be
+    /// re-encoded to UTF-8 bytes before it can be spliced into a byte
+    /// buffer -- unlike the char path, where a `char` is a `char` is a
+    /// `char` and no re-encoding step exists at all. Everything else
+    /// (capacity growth, tail-shifting, padding) is the same algorithm,
+    /// just measured in bytes instead of chars.
+    #[allow(dead_code)]
+    fn splice_into_buf_bytes(&mut self, start: usize, end: usize, replacement: &[char]) -> usize {
+        let encoded_string: String = replacement.iter().collect();
+        let encoded = encoded_string.as_bytes();
+
+        let old_span = end - start;
+        let new_span = encoded.len() + 2;
+        let delta = new_span as i64 - old_span as i64;
+        if delta > 0 {
+            let needed = (self.limit as i64 + delta) as usize;
+            if needed > self.buf.as_bytes().len() {
+                let mut newcap = self.buf.as_bytes().len().max(1) * 2;
+                while newcap < needed {
+                    newcap *= 2;
+                }
+                self.buf.as_bytes_mut().resize(newcap, 0);
+            }
+        }
+        // Move tail.
+        if new_span != old_span {
+            let tail_len = self.limit - end;
+            if delta > 0 {
+                // shift right, back to front
+                for i in (0..tail_len).rev() {
+                    self.buf.as_bytes_mut()[start + new_span + i] = self.buf.as_bytes()[end + i];
+                }
+            } else {
+                for i in 0..tail_len {
+                    self.buf.as_bytes_mut()[start + new_span + i] = self.buf.as_bytes()[end + i];
+                }
+            }
+        }
+        self.buf.as_bytes_mut()[start] = b' ';
+        self.buf.as_bytes_mut()[start + 1..start + 1 + encoded.len()].copy_from_slice(encoded);
+        self.buf.as_bytes_mut()[start + 1 + encoded.len()] = b' ';
+        self.limit = (self.limit as i64 + delta) as usize;
+        self.last_splice_end = (start + new_span) as i64;
+        self.saw_splice_since_declaration_start = true;
+        start
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `splice_pe_reference_at`.
+    #[allow(dead_code)]
+    fn splice_pe_reference_at_bytes(
+        &mut self,
+        p: usize,
+        pending: &mut PendingDecls,
+        check_paren_balance: bool,
+    ) -> ParseResult<usize> {
+        let replacement_chars = match self.resolve_parameter_entity_reference_at_bytes(p, pending)?
+        {
+            None => return Ok(self.limit),
+            Some(v) => v,
+        };
+        if check_paren_balance {
+            self.check_pe_replacement_paren_balance(&replacement_chars)?;
+        }
+        let end = self.last_pe_reference_end;
+        Ok(self.splice_into_buf_bytes(p, end, &replacement_chars))
     }
 
     fn check_pe_replacement_paren_balance(&mut self, replacement_chars: &[char]) -> ParseResult<()> {
@@ -4435,6 +8344,48 @@ impl<'a> Scanner<'a> {
         Ok(Some(replacement))
     }
 
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `resolve_parameter_entity_reference_at`. Only the name-scanning
+    /// step is representation-dependent -- `resolve_parameter_entity_replacement`
+    /// already operates purely on entity tables and returns `Rc<[char]>`
+    /// regardless of which path resolved the name, so it's reused
+    /// unchanged. Buffer splicing itself (`splice_into_buf`) is a
+    /// separate, still-char-only concern this hands off to (used for PE
+    /// references as declaration separators, not from within a quoted
+    /// literal).
+    #[allow(dead_code)]
+    fn resolve_parameter_entity_reference_at_bytes(
+        &mut self,
+        p: usize,
+        pending: &mut PendingDecls,
+    ) -> ParseResult<Option<Rc<[char]>>> {
+        let name_start = p + 1;
+        let q = match self.scan_name_chars_bytes(name_start) {
+            NameScanBytes::NeedMore => return Ok(None),
+            NameScanBytes::Illegal => {
+                return Err(self.fatal("Malformed parameter entity reference"));
+            }
+            NameScanBytes::End(q) => q,
+        };
+        if q == name_start || self.buf.as_bytes()[q] != b';' {
+            return Err(self.fatal("Malformed parameter entity reference"));
+        }
+        self.check_name_start_char_bytes(name_start)?;
+        if !self.parsing_external_content {
+            return Err(self.fatal(
+                "Well-Formedness Constraint: PEs in Internal Subset (Section 2.8). A parameter entity reference may not occur within a markup declaration in the internal DTD subset.",
+            ));
+        }
+        let name = self.slice_bytes(name_start, q);
+        let replacement = match self.resolve_parameter_entity_replacement(&name, pending)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        self.check_entity_expansion_limit(replacement.len() as i64)?;
+        self.last_pe_reference_end = q + 1;
+        Ok(Some(replacement))
+    }
+
     fn skip_whitespace_in_declaration(
         &mut self,
         mut p: usize,
@@ -4447,6 +8398,27 @@ impl<'a> Scanner<'a> {
                 return Ok(p);
             }
             p = self.splice_pe_reference_at(p, pending, check_paren_balance)?;
+            if p >= self.limit {
+                return Ok(p);
+            }
+        }
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-native counterpart to
+    /// `skip_whitespace_in_declaration`.
+    #[allow(dead_code)]
+    fn skip_whitespace_in_declaration_bytes(
+        &mut self,
+        mut p: usize,
+        pending: &mut PendingDecls,
+        check_paren_balance: bool,
+    ) -> ParseResult<usize> {
+        loop {
+            p = self.skip_optional_whitespace_bytes(p);
+            if p >= self.limit || self.buf.as_bytes()[p] != b'%' {
+                return Ok(p);
+            }
+            p = self.splice_pe_reference_at_bytes(p, pending, check_paren_balance)?;
             if p >= self.limit {
                 return Ok(p);
             }
@@ -4838,4 +8810,2603 @@ fn read_system_id(resolved: &str) -> std::io::Result<Vec<u8>> {
         resolved.to_string()
     };
     std::fs::read(&path)
+}
+
+/// Exploratory (explore/utf8-byte-path): correctness tests for the
+/// byte-native content-run scanner, checked directly against real
+/// `Scanner` state — not a standalone reimplementation like the earlier
+/// scratchpad microbenchmark — and, where it matters, against the
+/// existing char-based path on identical input.
+#[cfg(test)]
+mod byte_path_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    use crate::features::FeatureSet;
+    use crate::handler::DefaultHandler;
+
+    fn make_scanner(handler: &mut dyn XmlHandler, xml11: bool) -> Scanner<'_> {
+        let features = FeatureSet::default();
+        let settings = features.scanner_settings();
+        Scanner::new(handler, xml11, None, None, None, false, true, settings, false).unwrap()
+    }
+
+    #[test]
+    fn ascii_stops_at_lt() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"hello<world");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+        assert_eq!(s.pos, 5);
+    }
+
+    #[test]
+    fn ascii_stops_at_amp() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a & b");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+        assert_eq!(s.pos, 2);
+    }
+
+    #[test]
+    fn no_stop_byte_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"hello world");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::NeedMore);
+        assert_eq!(s.pos, s.limit);
+    }
+
+    #[test]
+    fn cdata_end_marker_outside_cdata_is_illegal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"]]>");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Illegal);
+    }
+
+    #[test]
+    fn single_bracket_is_not_illegal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a]b>c<");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+        assert_eq!(s.pos, 5);
+    }
+
+    #[test]
+    fn bare_control_char_is_illegal_in_xml10() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"ok\x01more");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Illegal);
+    }
+
+    #[test]
+    fn restricted_char_allowed_when_flagged_in_xml11() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, true);
+        s.switch_to_bytes_mode();
+        s.allow_restricted_char_in_content = true;
+        s.append_bytes(b"ok\x01more<");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+    }
+
+    #[test]
+    fn restricted_char_illegal_in_xml11_when_not_flagged() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, true);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"ok\x01more");
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Illegal);
+    }
+
+    #[test]
+    fn multibyte_sequence_passes_through_as_legal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes("café<x".as_bytes());
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "café");
+    }
+
+    #[test]
+    fn multibyte_sequence_split_across_receive_calls() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        let full = "café<x";
+        let bytes = full.as_bytes();
+        // Split right after the lead byte of 'é' (0xC3 0xA9), before its
+        // continuation byte arrives — a chunk boundary can legitimately
+        // land here.
+        let split_at = bytes.iter().position(|&b| b == 0xC3).unwrap() + 1;
+
+        s.append_bytes(&bytes[..split_at]);
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::NeedMore);
+
+        s.append_bytes(&bytes[split_at..]);
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Stop);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "é");
+    }
+
+    #[test]
+    fn ill_formed_utf8_is_illegal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        // 0xC3 followed by an ASCII byte is not a valid continuation.
+        s.append_bytes(&[b'o', b'k', 0xC3, b'x']);
+        assert_eq!(s.scan_content_run_bytes(), ContentRunBytes::Illegal);
+    }
+
+    /// Parity check against the existing, fully-tested char path: same
+    /// input, same outcome, same consumed text — compared as text (not
+    /// raw position numbers, since those are in different units on the
+    /// two paths) so the comparison doesn't depend on either
+    /// representation's internal bookkeeping.
+    #[test]
+    fn matches_char_path_on_mixed_content() {
+        let text = "héllo wörld<tag";
+
+        let mut app_b = DefaultHandler;
+        let mut sb = make_scanner(&mut app_b, false);
+        sb.switch_to_bytes_mode();
+        sb.append_bytes(text.as_bytes());
+        assert_eq!(sb.scan_content_run_bytes(), ContentRunBytes::Stop);
+        let consumed_bytes = std::str::from_utf8(&sb.buf.as_bytes()[..sb.pos]).unwrap();
+
+        let mut app_c = DefaultHandler;
+        let mut sc = make_scanner(&mut app_c, false);
+        sc.append(text);
+        assert!(sc.scan_content_run_fast().is_ok());
+        let consumed_chars: String = sc.buf.as_chars()[..sc.pos].iter().collect();
+
+        assert_eq!(consumed_bytes, consumed_chars);
+        assert_eq!(consumed_bytes, "héllo wörld");
+    }
+
+    #[test]
+    fn attr_value_stops_at_quote() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"value\"rest");
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Quote);
+        assert_eq!(s.pos, 5);
+    }
+
+    #[test]
+    fn attr_value_stops_at_amp() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a&amp;b\"");
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Amp);
+        assert_eq!(s.pos, 1);
+    }
+
+    #[test]
+    fn attr_value_lt_is_illegal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a<b\"");
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Illegal);
+    }
+
+    #[test]
+    fn attr_value_no_stop_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"just text");
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::NeedMore);
+    }
+
+    #[test]
+    fn attr_value_normalizes_tab_newline_cr_to_space_in_place() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a\tb\nc\rd\"");
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Quote);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "a b c d");
+    }
+
+    #[test]
+    fn attr_value_different_quote_char_passes_through() {
+        // Single-quoted attribute: double quote is ordinary content.
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"say \"hi\"'rest");
+        assert_eq!(s.scan_attr_value_run_bytes(b'\''), AttrValueRunBytes::Quote);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "say \"hi\"");
+    }
+
+    #[test]
+    fn attr_value_multibyte_passes_through() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes("café\"".as_bytes());
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Quote);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "café");
+    }
+
+    #[test]
+    fn attr_value_multibyte_split_across_receive_calls() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        let full = "café\"";
+        let bytes = full.as_bytes();
+        let split_at = bytes.iter().position(|&b| b == 0xC3).unwrap() + 1;
+
+        s.append_bytes(&bytes[..split_at]);
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::NeedMore);
+
+        s.append_bytes(&bytes[split_at..]);
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Quote);
+        let consumed = std::str::from_utf8(&s.buf.as_bytes()[..s.pos]).unwrap();
+        assert_eq!(consumed, "é");
+    }
+
+    #[test]
+    fn attr_value_ill_formed_utf8_is_illegal() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(&[b'o', b'k', 0xC3, b'x']);
+        assert_eq!(s.scan_attr_value_run_bytes(b'"'), AttrValueRunBytes::Illegal);
+    }
+
+    /// Parity check against `is_attr_stop`, char by char, on mixed
+    /// content — the byte scanner should stop at exactly the same
+    /// logical position `is_attr_stop` would call a stop, for both the
+    /// quote-terminated and the ampersand-terminated cases.
+    #[test]
+    fn attr_value_matches_is_attr_stop_char_by_char() {
+        let text = "héllo\"wörld&x\"";
+        let quote = '"';
+
+        let mut app_c = DefaultHandler;
+        let sc = make_scanner(&mut app_c, false);
+        let mut char_pos = None;
+        for (i, c) in text.chars().enumerate() {
+            if sc.is_attr_stop(c, quote) {
+                char_pos = Some(i);
+                break;
+            }
+        }
+        let stop_char = text.chars().nth(char_pos.unwrap()).unwrap();
+
+        let mut app_b = DefaultHandler;
+        let mut sb = make_scanner(&mut app_b, false);
+        sb.switch_to_bytes_mode();
+        sb.append_bytes(text.as_bytes());
+        let result = sb.scan_attr_value_run_bytes(quote as u8);
+        let consumed = std::str::from_utf8(&sb.buf.as_bytes()[..sb.pos]).unwrap();
+
+        let expected_consumed: String = text.chars().take(char_pos.unwrap()).collect();
+        assert_eq!(consumed, expected_consumed);
+        match stop_char {
+            '"' => assert_eq!(result, AttrValueRunBytes::Quote),
+            '&' => assert_eq!(result, AttrValueRunBytes::Amp),
+            _ => panic!("unexpected stop char {stop_char:?}"),
+        }
+    }
+
+    /// Records `attribute_value_content` calls exactly as the real
+    /// handler would see them, to prove `scan_attribute_value_streaming_bytes`
+    /// drives the genuine, unmodified handler-facing layer correctly —
+    /// not a byte-native stand-in for it. Shares its call log via
+    /// `Rc<RefCell<..>>` rather than owning it directly, since the
+    /// `Scanner` under test holds `&mut` the handler for its whole
+    /// lifetime and tests need to inspect calls while `s` is still alive
+    /// (between chunks, mid-scan).
+    #[derive(Default, Clone)]
+    struct RecordingHandler {
+        calls: Rc<RefCell<Vec<(String, bool)>>>,
+    }
+
+    impl XmlHandler for RecordingHandler {
+        fn attribute_value_content(&mut self, value: &str, end: bool) -> ParseResult<()> {
+            self.calls.borrow_mut().push((value.to_string(), end));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_emits_to_real_handler() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"hello\"rest");
+        let result = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(result, AttrValueScanBytes::Done);
+        assert_eq!(*calls.borrow(), vec![("hello".to_string(), true)]);
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_emits_multibyte_content() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes("café\"".as_bytes());
+        let result = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(result, AttrValueScanBytes::Done);
+        assert_eq!(*calls.borrow(), vec![("café".to_string(), true)]);
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_emits_partial_then_final_chunk() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"partial");
+        let r1 = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(r1, AttrValueScanBytes::NeedMore);
+        assert_eq!(*calls.borrow(), vec![("partial".to_string(), false)]);
+
+        s.append_bytes(b" rest\"tail");
+        let r2 = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(r2, AttrValueScanBytes::Done);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("partial".to_string(), false),
+                (" rest".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_resolves_predefined_entity() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"pre&amp;post\"");
+        let result = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(result, AttrValueScanBytes::Done);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("pre".to_string(), false),
+                ("&".to_string(), false),
+                ("post".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_resolves_general_entity() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.general_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"pre&foo;post\"");
+        let result = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(result, AttrValueScanBytes::Done);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("pre".to_string(), false),
+                ("bar".to_string(), false),
+                ("post".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_undeclared_entity_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"pre&undeclared;post\"");
+        assert!(s.scan_attribute_value_streaming_bytes(b'"').is_err());
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_needs_more_mid_entity_name() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.general_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"pre&fo");
+        let r1 = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(r1, AttrValueScanBytes::NeedMore);
+        assert_eq!(*calls.borrow(), vec![("pre".to_string(), false)]);
+
+        s.append_bytes(b"o;post\"");
+        let r2 = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(r2, AttrValueScanBytes::Done);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("pre".to_string(), false),
+                ("bar".to_string(), false),
+                ("post".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_attribute_value_streaming_bytes_normalizes_whitespace() {
+        let mut app = RecordingHandler::default();
+        let calls = Rc::clone(&app.calls);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"a\tb\nc\"");
+        let result = s.scan_attribute_value_streaming_bytes(b'"').unwrap();
+        assert_eq!(result, AttrValueScanBytes::Done);
+        assert_eq!(*calls.borrow(), vec![("a b c".to_string(), true)]);
+    }
+
+    // ===== decode_entity_ref_bytes =====
+
+    #[test]
+    fn decimal_char_ref() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#65;rest");
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::Decoded("A".to_string()));
+        assert_eq!(s.pos, 5);
+    }
+
+    #[test]
+    fn hex_char_ref() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#x41;rest");
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::Decoded("A".to_string()));
+        assert_eq!(s.pos, 6);
+    }
+
+    #[test]
+    fn predefined_named_entities() {
+        for (input, expected) in [
+            (&b"&amp;"[..], "&"),
+            (&b"&lt;"[..], "<"),
+            (&b"&gt;"[..], ">"),
+            (&b"&apos;"[..], "'"),
+            (&b"&quot;"[..], "\""),
+        ] {
+            let mut app = DefaultHandler;
+            let mut s = make_scanner(&mut app, false);
+            s.switch_to_bytes_mode();
+            s.append_bytes(input);
+            let result = s.decode_entity_ref_bytes().unwrap();
+            assert_eq!(result, RefResult::Decoded(expected.to_string()));
+            assert_eq!(s.pos, input.len());
+        }
+    }
+
+    #[test]
+    fn general_named_entity() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&myentity;rest");
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::General("myentity".to_string()));
+        assert_eq!(s.pos, 10);
+    }
+
+    #[test]
+    fn general_named_entity_with_multibyte_name_char() {
+        // Combining characters and other non-ASCII NameChars are legal
+        // inside an XML Name after the first character; exercise the
+        // multi-byte decode-on-demand path in the name-scanning loop.
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        let input = "&café;rest".as_bytes();
+        s.append_bytes(input);
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::General("café".to_string()));
+        assert_eq!(s.pos, "&café;".len());
+    }
+
+    #[test]
+    fn empty_char_ref_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#;rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn invalid_decimal_digit_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#6z;rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn invalid_hex_digit_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#xzz;rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn out_of_range_char_ref_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#xFFFFFFFF;rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn bad_name_start_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&1bad;rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn missing_terminating_semicolon_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&amp rest");
+        assert!(s.decode_entity_ref_bytes().is_err());
+    }
+
+    #[test]
+    fn truncated_numeric_ref_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#65");
+        assert_eq!(s.decode_entity_ref_bytes().unwrap(), RefResult::NeedMore);
+
+        s.append_bytes(b";rest");
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::Decoded("A".to_string()));
+    }
+
+    #[test]
+    fn truncated_named_ref_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&am");
+        assert_eq!(s.decode_entity_ref_bytes().unwrap(), RefResult::NeedMore);
+
+        s.append_bytes(b"p;rest");
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::Decoded("&".to_string()));
+    }
+
+    #[test]
+    fn named_ref_split_mid_multibyte_char_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        let full = "&café;rest".as_bytes();
+        // Split right after the lead byte of 'é' (0xC3 0xA9), before its
+        // continuation byte arrives.
+        let split_at = full.iter().position(|&b| b == 0xC3).unwrap() + 1;
+
+        s.append_bytes(&full[..split_at]);
+        assert_eq!(s.decode_entity_ref_bytes().unwrap(), RefResult::NeedMore);
+
+        s.append_bytes(&full[split_at..]);
+        let result = s.decode_entity_ref_bytes().unwrap();
+        assert_eq!(result, RefResult::General("café".to_string()));
+    }
+
+    #[test]
+    fn matches_char_path_on_identical_input() {
+        let cases: &[&[u8]] = &[
+            b"&#65;",
+            b"&#x41;",
+            b"&amp;",
+            b"&lt;",
+            b"&myentity;",
+        ];
+        for input in cases {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input);
+            let byte_result = sb.decode_entity_ref_bytes().unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            let text: String = input.iter().map(|&b| b as char).collect();
+            sc.append(&text);
+            let char_result = sc.decode_entity_ref().unwrap();
+
+            assert_eq!(byte_result, char_result);
+            assert_eq!(sb.pos, sc.pos);
+        }
+    }
+
+    // ===== scan_start_tag_bytes / scan_attributes_and_tag_end_bytes =====
+
+    /// Records element/attribute events as formatted strings, to prove
+    /// `scan_start_tag_bytes`/`scan_attributes_and_tag_end_bytes` drive the
+    /// genuine, unmodified handler-facing layer -- same rationale as
+    /// `RecordingHandler` above, just covering the wider event vocabulary
+    /// these two functions touch.
+    #[derive(Default, Clone)]
+    struct TagRecordingHandler {
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl XmlHandler for TagRecordingHandler {
+        fn start_element(&mut self, q_name: &str) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("start_element({q_name})"));
+            Ok(())
+        }
+        fn start_attribute(
+            &mut self,
+            name: &str,
+            ty: &str,
+            declared: bool,
+            specified: bool,
+        ) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("start_attribute({name},{ty},{declared},{specified})"));
+            Ok(())
+        }
+        fn attribute_value_content(&mut self, value: &str, end: bool) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("attr_value({value:?},{end})"));
+            Ok(())
+        }
+        fn end_attributes(&mut self) -> ParseResult<()> {
+            self.events.borrow_mut().push("end_attributes".to_string());
+            Ok(())
+        }
+        fn end_element(&mut self) -> ParseResult<()> {
+            self.events.borrow_mut().push("end_element".to_string());
+            Ok(())
+        }
+        fn start_comment(&mut self) -> ParseResult<()> {
+            self.events.borrow_mut().push("start_comment".to_string());
+            Ok(())
+        }
+        fn comment_data(&mut self, text: &str, end: bool) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("comment_data({text:?},{end})"));
+            Ok(())
+        }
+        fn start_cdata(&mut self) -> ParseResult<()> {
+            self.events.borrow_mut().push("start_cdata".to_string());
+            Ok(())
+        }
+        fn characters(&mut self, text: &str, ignorable: bool, end: bool) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("characters({text:?},{ignorable},{end})"));
+            Ok(())
+        }
+        fn end_cdata(&mut self) -> ParseResult<()> {
+            self.events.borrow_mut().push("end_cdata".to_string());
+            Ok(())
+        }
+        fn pi_target(&mut self, target: &str) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("pi_target({target})"));
+            Ok(())
+        }
+        fn pi_data(&mut self, data: &str, end: bool) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("pi_data({data:?},{end})"));
+            Ok(())
+        }
+        fn start_entity(&mut self, name: &str) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("start_entity({name})"));
+            Ok(())
+        }
+        fn end_entity(&mut self, name: &str) -> ParseResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("end_entity({name})"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scan_start_tag_bytes_self_closing_no_attributes() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<foo/>");
+        assert!(s.scan_start_tag_bytes(0).unwrap());
+        assert!(s.scan_attributes_and_tag_end_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_element(foo)".to_string(),
+                "end_attributes".to_string(),
+                "end_element".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_start_tag_bytes_with_attributes_not_self_closing() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<foo a=\"1\" b='2'>");
+        assert!(s.scan_start_tag_bytes(0).unwrap());
+        assert!(s.scan_attributes_and_tag_end_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_element(foo)".to_string(),
+                "start_attribute(a,CDATA,false,true)".to_string(),
+                "attr_value(\"1\",true)".to_string(),
+                "start_attribute(b,CDATA,false,true)".to_string(),
+                "attr_value(\"2\",true)".to_string(),
+                "end_attributes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_attributes_and_tag_end_bytes_resolves_entity_in_value() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<foo a=\"x&amp;y\">");
+        assert!(s.scan_start_tag_bytes(0).unwrap());
+        assert!(s.scan_attributes_and_tag_end_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_element(foo)".to_string(),
+                "start_attribute(a,CDATA,false,true)".to_string(),
+                "attr_value(\"x\",false)".to_string(),
+                "attr_value(\"&\",false)".to_string(),
+                "attr_value(\"y\",true)".to_string(),
+                "end_attributes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_start_tag_bytes_split_across_receive_calls() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<fo");
+        assert!(!s.scan_start_tag_bytes(0).unwrap());
+        assert_eq!(s.pos, 0);
+
+        s.append_bytes(b"o/>");
+        assert!(s.scan_start_tag_bytes(0).unwrap());
+        assert!(s.scan_attributes_and_tag_end_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_element(foo)".to_string(),
+                "end_attributes".to_string(),
+                "end_element".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_start_tag_bytes_bad_name_start_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<1abc>");
+        assert!(s.scan_start_tag_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_attributes_and_tag_end_bytes_duplicate_attribute_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<foo a=\"1\" a=\"2\">");
+        assert!(s.scan_start_tag_bytes(0).unwrap());
+        assert!(s.scan_attributes_and_tag_end_bytes().is_err());
+    }
+
+    #[test]
+    fn tag_scanning_matches_char_path_on_identical_input() {
+        let inputs: &[&str] = &["<foo/>", "<foo a=\"1\" b='2'>", "<foo a=\"x&amp;y\">"];
+        for input in inputs {
+            let mut app_bytes = TagRecordingHandler::default();
+            let bytes_events = Rc::clone(&app_bytes.events);
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let start_ok = sb.scan_start_tag_bytes(0).unwrap();
+            assert!(start_ok);
+            sb.scan_attributes_and_tag_end_bytes().unwrap();
+
+            let mut app_chars = TagRecordingHandler::default();
+            let char_events = Rc::clone(&app_chars.events);
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            assert!(sc.scan_start_tag(0).unwrap());
+            sc.scan_attributes_and_tag_end().unwrap();
+
+            assert_eq!(*bytes_events.borrow(), *char_events.borrow());
+        }
+    }
+
+    // ===== scan_end_tag_bytes =====
+
+    #[test]
+    fn scan_end_tag_bytes_fast_path_match() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("foo"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</foo>rest");
+        assert!(s.scan_end_tag_bytes(0).unwrap());
+        assert_eq!(s.pos, 6);
+        assert!(s.element_stack.is_empty());
+        assert_eq!(*events.borrow(), vec!["end_element".to_string()]);
+    }
+
+    #[test]
+    fn scan_end_tag_bytes_general_path_with_whitespace() {
+        let mut app = TagRecordingHandler::default();
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("foo"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</foo  >rest");
+        assert!(s.scan_end_tag_bytes(0).unwrap());
+        assert_eq!(s.pos, 8);
+        assert!(s.element_stack.is_empty());
+    }
+
+    #[test]
+    fn scan_end_tag_bytes_split_across_receive_calls() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("foo"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</fo");
+        assert!(!s.scan_end_tag_bytes(0).unwrap());
+        assert_eq!(s.pos, 0);
+
+        s.append_bytes(b"o>");
+        assert!(s.scan_end_tag_bytes(0).unwrap());
+        assert!(s.element_stack.is_empty());
+    }
+
+    #[test]
+    fn scan_end_tag_bytes_mismatched_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("foo"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</bar>");
+        assert!(s.scan_end_tag_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_end_tag_bytes_no_matching_start_tag_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</foo>");
+        assert!(s.scan_end_tag_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_end_tag_bytes_bad_name_start_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        // Push a different name so the fast path (which trusts a literal
+        // match without checking NameStartChar, same as the char path)
+        // doesn't short-circuit before the general path's validation runs.
+        s.element_stack.push(Rc::from("foo"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"</1bad>");
+        assert!(s.scan_end_tag_bytes(0).is_err());
+    }
+
+    #[test]
+    fn end_tag_scanning_matches_char_path_on_identical_input() {
+        for input in ["</foo>", "</foo  >"] {
+            let mut app_bytes = TagRecordingHandler::default();
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.element_stack.push(Rc::from("foo"));
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let byte_ok = sb.scan_end_tag_bytes(0).unwrap();
+
+            let mut app_chars = TagRecordingHandler::default();
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.element_stack.push(Rc::from("foo"));
+            sc.append(input);
+            let char_ok = sc.scan_end_tag(0).unwrap();
+
+            assert_eq!(byte_ok, char_ok);
+            assert_eq!(sb.pos, sc.pos);
+        }
+    }
+
+    // ===== scan_comment_bytes =====
+
+    #[test]
+    fn scan_comment_bytes_full_comment() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!--hello-->rest");
+        assert!(s.scan_comment_bytes(0).unwrap());
+        assert_eq!(s.pos, 12);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_comment".to_string(),
+                "comment_data(\"hello\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_comment_bytes_needs_more() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!--hel");
+        assert!(!s.scan_comment_bytes(0).unwrap());
+
+        s.append_bytes(b"lo-->rest");
+        assert!(s.scan_comment_data_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_comment".to_string(),
+                "comment_data(\"hel\",false)".to_string(),
+                "comment_data(\"lo\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_comment_bytes_double_dash_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!--a--b-->");
+        assert!(s.scan_comment_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_comment_bytes_illegal_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!--a\x01b-->");
+        assert!(s.scan_comment_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_comment_bytes_malformed_declaration_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!-x-->");
+        assert!(s.scan_comment_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_comment_bytes_multibyte_content() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes("<!--café-->rest".as_bytes());
+        assert!(s.scan_comment_bytes(0).unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_comment".to_string(),
+                "comment_data(\"café\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_scanning_matches_char_path() {
+        let mut app_bytes = TagRecordingHandler::default();
+        let bytes_events = Rc::clone(&app_bytes.events);
+        let mut sb = make_scanner(&mut app_bytes, false);
+        sb.switch_to_bytes_mode();
+        sb.append_bytes(b"<!--hello-->rest");
+        sb.scan_comment_bytes(0).unwrap();
+
+        let mut app_chars = TagRecordingHandler::default();
+        let char_events = Rc::clone(&app_chars.events);
+        let mut sc = make_scanner(&mut app_chars, false);
+        sc.append("<!--hello-->rest");
+        sc.scan_comment(0).unwrap();
+
+        assert_eq!(*bytes_events.borrow(), *char_events.borrow());
+        assert_eq!(sb.pos, sc.pos);
+    }
+
+    // ===== scan_cdata_bytes =====
+
+    #[test]
+    fn scan_cdata_bytes_full_section() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("root"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<![CDATA[hi]]>rest");
+        assert!(s.scan_cdata_bytes(0).unwrap());
+        assert_eq!(s.pos, 14);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_cdata".to_string(),
+                "characters(\"hi\",false,true)".to_string(),
+                "end_cdata".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_cdata_bytes_outside_element_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<![CDATA[hi]]>rest");
+        assert!(s.scan_cdata_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_cdata_bytes_needs_more_mid_marker() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("root"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<![CDA");
+        assert!(!s.scan_cdata_bytes(0).unwrap());
+        assert_eq!(s.pos, 0);
+
+        s.append_bytes(b"TA[hi]]>rest");
+        assert!(s.scan_cdata_bytes(0).unwrap());
+    }
+
+    #[test]
+    fn scan_cdata_bytes_needs_more_mid_content() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("root"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<![CDATA[hi");
+        assert!(!s.scan_cdata_bytes(0).unwrap());
+
+        s.append_bytes(b"]]>rest");
+        assert!(s.scan_cdata_content_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_cdata".to_string(),
+                "characters(\"hi\",false,false)".to_string(),
+                "characters(\"\",false,true)".to_string(),
+                "end_cdata".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_cdata_bytes_single_bracket_is_not_end_marker() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.element_stack.push(Rc::from("root"));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<![CDATA[a]b]]>rest");
+        assert!(s.scan_cdata_bytes(0).unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_cdata".to_string(),
+                "characters(\"a]b\",false,true)".to_string(),
+                "end_cdata".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cdata_scanning_matches_char_path() {
+        let mut app_bytes = TagRecordingHandler::default();
+        let bytes_events = Rc::clone(&app_bytes.events);
+        let mut sb = make_scanner(&mut app_bytes, false);
+        sb.element_stack.push(Rc::from("root"));
+        sb.switch_to_bytes_mode();
+        sb.append_bytes(b"<![CDATA[a]b]]>rest");
+        sb.scan_cdata_bytes(0).unwrap();
+
+        let mut app_chars = TagRecordingHandler::default();
+        let char_events = Rc::clone(&app_chars.events);
+        let mut sc = make_scanner(&mut app_chars, false);
+        sc.element_stack.push(Rc::from("root"));
+        sc.append("<![CDATA[a]b]]>rest");
+        sc.scan_cdata(0).unwrap();
+
+        assert_eq!(*bytes_events.borrow(), *char_events.borrow());
+        assert_eq!(sb.pos, sc.pos);
+    }
+
+    // ===== scan_pi_bytes =====
+
+    #[test]
+    fn scan_pi_bytes_full_pi_with_data() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<?foo bar?>rest");
+        assert!(s.scan_pi_bytes(0).unwrap());
+        assert_eq!(s.pos, 11);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "pi_target(foo)".to_string(),
+                "pi_data(\"bar\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_pi_bytes_no_data() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<?foo?>rest");
+        assert!(s.scan_pi_bytes(0).unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "pi_target(foo)".to_string(),
+                "pi_data(\"\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_pi_bytes_reserved_xml_target_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<?xml version=\"1.0\"?>");
+        assert!(s.scan_pi_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_pi_bytes_needs_more_mid_target() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<?fo");
+        assert!(!s.scan_pi_bytes(0).unwrap());
+        assert_eq!(s.pos, 0);
+
+        s.append_bytes(b"o bar?>rest");
+        assert!(s.scan_pi_bytes(0).unwrap());
+    }
+
+    #[test]
+    fn scan_pi_bytes_needs_more_mid_data() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<?foo ba");
+        assert!(!s.scan_pi_bytes(0).unwrap());
+
+        s.append_bytes(b"r?>rest");
+        assert!(s.scan_pi_data_bytes().unwrap());
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "pi_target(foo)".to_string(),
+                "pi_data(\"ba\",false)".to_string(),
+                "pi_data(\"r\",true)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pi_scanning_matches_char_path() {
+        for input in ["<?foo bar?>rest", "<?foo?>rest"] {
+            let mut app_bytes = TagRecordingHandler::default();
+            let bytes_events = Rc::clone(&app_bytes.events);
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            sb.scan_pi_bytes(0).unwrap();
+
+            let mut app_chars = TagRecordingHandler::default();
+            let char_events = Rc::clone(&app_chars.events);
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            sc.scan_pi(0).unwrap();
+
+            assert_eq!(*bytes_events.borrow(), *char_events.borrow());
+            assert_eq!(sb.pos, sc.pos);
+        }
+    }
+
+    // ===== skip_external_id_bytes =====
+
+    #[test]
+    fn skip_external_id_bytes_system_only() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"SYSTEM \"http://example.com/a.dtd\"X");
+        let r = s.skip_external_id_bytes(0).unwrap();
+        assert_eq!(s.last_external_id_public_id, None);
+        assert_eq!(
+            s.last_external_id_system_id,
+            Some("http://example.com/a.dtd".to_string())
+        );
+        assert_eq!(r, Some(33));
+    }
+
+    #[test]
+    fn skip_external_id_bytes_public_and_system() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"PUBLIC \"-//A//B\" \"sys.dtd\"X");
+        let r = s.skip_external_id_bytes(0).unwrap();
+        assert_eq!(s.last_external_id_public_id, Some("-//A//B".to_string()));
+        assert_eq!(s.last_external_id_system_id, Some("sys.dtd".to_string()));
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn skip_external_id_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"SYSTEM \"http");
+        assert_eq!(s.skip_external_id_bytes(0).unwrap(), None);
+
+        s.append_bytes(b"://x\"Y");
+        let r = s.skip_external_id_bytes(0).unwrap();
+        assert_eq!(s.last_external_id_system_id, Some("http://x".to_string()));
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn skip_external_id_bytes_missing_keyword_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"FOO \"bar\"");
+        assert!(s.skip_external_id_bytes(0).is_err());
+    }
+
+    #[test]
+    fn skip_external_id_matches_char_path() {
+        for input in ["SYSTEM \"sys.dtd\"X", "PUBLIC \"-//A//B\" \"sys.dtd\"X"] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let br = sb.skip_external_id_bytes(0).unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let cr = sc.skip_external_id(0).unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(sb.last_external_id_public_id, sc.last_external_id_public_id);
+            assert_eq!(sb.last_external_id_system_id, sc.last_external_id_system_id);
+        }
+    }
+
+    // ===== scan_notation_declaration_bytes =====
+
+    #[test]
+    fn scan_notation_declaration_bytes_system() {
+        let mut app = TagRecordingHandler::default();
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo SYSTEM \"sys.dtd\">rest");
+        let r = s.scan_notation_declaration_bytes(0).unwrap();
+        assert!(r.is_some());
+        assert!(s.declared_notations.contains("foo"));
+        assert_eq!(
+            s.notation_external_ids.get("foo").unwrap().system_id,
+            Some("sys.dtd".to_string())
+        );
+    }
+
+    #[test]
+    fn scan_notation_declaration_bytes_public_with_system() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo PUBLIC \"-//A//B\" \"sys.dtd\">rest");
+        s.scan_notation_declaration_bytes(0).unwrap();
+        let ext = s.notation_external_ids.get("foo").unwrap();
+        assert_eq!(ext.public_id, Some("-//A//B".to_string()));
+        assert_eq!(ext.system_id, Some("sys.dtd".to_string()));
+    }
+
+    #[test]
+    fn scan_notation_declaration_bytes_public_only() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo PUBLIC \"-//A//B\">rest");
+        s.scan_notation_declaration_bytes(0).unwrap();
+        let ext = s.notation_external_ids.get("foo").unwrap();
+        assert_eq!(ext.public_id, Some("-//A//B".to_string()));
+        assert_eq!(ext.system_id, None);
+    }
+
+    #[test]
+    fn scan_notation_declaration_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo SYSTEM \"sys");
+        assert_eq!(s.scan_notation_declaration_bytes(0).unwrap(), None);
+
+        s.append_bytes(b".dtd\">rest");
+        let r = s.scan_notation_declaration_bytes(0).unwrap();
+        assert!(r.is_some());
+        assert!(s.declared_notations.contains("foo"));
+    }
+
+    #[test]
+    fn scan_notation_declaration_bytes_bad_name_start_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" 1foo SYSTEM \"sys.dtd\">rest");
+        assert!(s.scan_notation_declaration_bytes(0).is_err());
+    }
+
+    #[test]
+    fn notation_declaration_matches_char_path() {
+        for input in [
+            " foo SYSTEM \"sys.dtd\">rest",
+            " foo PUBLIC \"-//A//B\" \"sys.dtd\">rest",
+            " foo PUBLIC \"-//A//B\">rest",
+        ] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let br = sb.scan_notation_declaration_bytes(0).unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let cr = sc.scan_notation_declaration(0).unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(sb.notation_external_ids, sc.notation_external_ids);
+        }
+    }
+
+    // ===== decode_char_ref_into_bytes =====
+
+    #[test]
+    fn decode_char_ref_into_bytes_decimal_and_hex() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#65;rest");
+        let mut sb = String::new();
+        let r = s.decode_char_ref_into_bytes(&mut sb, 0).unwrap();
+        assert_eq!(sb, "A");
+        assert_eq!(r, Some(5));
+
+        let mut app2 = DefaultHandler;
+        let mut s2 = make_scanner(&mut app2, false);
+        s2.switch_to_bytes_mode();
+        s2.append_bytes(b"&#x41;rest");
+        let mut sb2 = String::new();
+        let r2 = s2.decode_char_ref_into_bytes(&mut sb2, 0).unwrap();
+        assert_eq!(sb2, "A");
+        assert_eq!(r2, Some(6));
+    }
+
+    #[test]
+    fn decode_char_ref_into_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&#65");
+        let mut sb = String::new();
+        assert_eq!(s.decode_char_ref_into_bytes(&mut sb, 0).unwrap(), None);
+    }
+
+    // ===== scan_reference_name_literal_bytes =====
+
+    #[test]
+    fn scan_reference_name_literal_bytes_preserves_literal_text() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&amp;rest");
+        let mut sb = String::new();
+        let r = s.scan_reference_name_literal_bytes(0, &mut sb, '&').unwrap();
+        assert_eq!(sb, "&amp;");
+        assert_eq!(r, Some(5));
+    }
+
+    #[test]
+    fn scan_reference_name_literal_bytes_missing_semicolon_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"&amp rest");
+        let mut sb = String::new();
+        assert!(s.scan_reference_name_literal_bytes(0, &mut sb, '&').is_err());
+    }
+
+    // ===== resolve_parameter_entity_reference_at_bytes =====
+
+    #[test]
+    fn resolve_parameter_entity_reference_at_bytes_resolves() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"%foo;rest");
+        let mut pending = PendingDecls::default();
+        let r = s
+            .resolve_parameter_entity_reference_at_bytes(0, &mut pending)
+            .unwrap();
+        assert_eq!(r, Some(Rc::from(['b', 'a', 'r'])));
+        assert_eq!(s.last_pe_reference_end, 5);
+    }
+
+    #[test]
+    fn resolve_parameter_entity_reference_at_bytes_disallowed_in_internal_subset() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = false;
+        s.parameter_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"%foo;rest");
+        let mut pending = PendingDecls::default();
+        assert!(s
+            .resolve_parameter_entity_reference_at_bytes(0, &mut pending)
+            .is_err());
+    }
+
+    // ===== scan_quoted_literal_with_char_refs_bytes =====
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_plain_text() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"hello\"rest");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        let r = s
+            .scan_quoted_literal_with_char_refs_bytes(0, &mut sb, false, &mut pending)
+            .unwrap();
+        assert_eq!(sb, "hello");
+        assert_eq!(r, Some(7));
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_resolves_char_ref() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"a&#65;b\"rest");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        s.scan_quoted_literal_with_char_refs_bytes(0, &mut sb, false, &mut pending)
+            .unwrap();
+        assert_eq!(sb, "aAb");
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_preserves_entity_ref_literally() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"a&amp;b\"rest");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        s.scan_quoted_literal_with_char_refs_bytes(0, &mut sb, false, &mut pending)
+            .unwrap();
+        assert_eq!(sb, "a&amp;b");
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_expands_pe_reference() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("foo".to_string(), Rc::from(['X', 'Y']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"a%foo;b\"rest");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        s.scan_quoted_literal_with_char_refs_bytes(0, &mut sb, true, &mut pending)
+            .unwrap();
+        assert_eq!(sb, "aXYb");
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"hel");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        assert_eq!(
+            s.scan_quoted_literal_with_char_refs_bytes(0, &mut sb, false, &mut pending)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_bytes_illegal_char_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"\"a\x01b\"rest");
+        let mut sb = String::new();
+        let mut pending = PendingDecls::default();
+        assert!(s
+            .scan_quoted_literal_with_char_refs_bytes(0, &mut sb, false, &mut pending)
+            .is_err());
+    }
+
+    #[test]
+    fn quoted_literal_with_char_refs_matches_char_path() {
+        for input in ["\"hello\"rest", "\"a&#65;b\"rest", "\"a&amp;b\"rest"] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb_scanner = make_scanner(&mut app_bytes, false);
+            sb_scanner.switch_to_bytes_mode();
+            sb_scanner.append_bytes(input.as_bytes());
+            let mut sb_str = String::new();
+            let mut pending_b = PendingDecls::default();
+            let br = sb_scanner
+                .scan_quoted_literal_with_char_refs_bytes(0, &mut sb_str, false, &mut pending_b)
+                .unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let mut sc_str = String::new();
+            let mut pending_c = PendingDecls::default();
+            let cr = sc
+                .scan_quoted_literal_with_char_refs(0, &mut sc_str, false, &mut pending_c)
+                .unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(sb_str, sc_str);
+        }
+    }
+
+    // ===== scan_entity_declaration_bytes =====
+
+    #[test]
+    fn scan_entity_declaration_bytes_internal_general() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo \"bar\">rest");
+        let mut pending = PendingDecls::default();
+        let r = s.scan_entity_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+        assert_eq!(
+            pending.entities.get("foo").unwrap(),
+            &Rc::from(['b', 'a', 'r'])
+        );
+    }
+
+    #[test]
+    fn scan_entity_declaration_bytes_internal_parameter() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" % foo \"bar\">rest");
+        let mut pending = PendingDecls::default();
+        s.scan_entity_declaration_bytes(0, &mut pending).unwrap();
+        assert_eq!(
+            pending.param_entities.get("foo").unwrap(),
+            &Rc::from(['b', 'a', 'r'])
+        );
+    }
+
+    #[test]
+    fn scan_entity_declaration_bytes_external_system() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo SYSTEM \"sys.ent\">rest");
+        let mut pending = PendingDecls::default();
+        s.scan_entity_declaration_bytes(0, &mut pending).unwrap();
+        let ext = pending.external_names.get("foo").unwrap();
+        assert_eq!(ext.system_id, Some("sys.ent".to_string()));
+        assert_eq!(ext.ndata, None);
+    }
+
+    #[test]
+    fn scan_entity_declaration_bytes_external_with_ndata() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo SYSTEM \"sys.bin\" NDATA gif>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_entity_declaration_bytes(0, &mut pending).unwrap();
+        let ext = pending.external_names.get("foo").unwrap();
+        assert_eq!(ext.ndata, Some("gif".to_string()));
+    }
+
+    #[test]
+    fn scan_entity_declaration_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo \"ba");
+        let mut pending = PendingDecls::default();
+        assert_eq!(s.scan_entity_declaration_bytes(0, &mut pending).unwrap(), None);
+
+        s.append_bytes(b"r\">rest");
+        let r = s.scan_entity_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+        assert_eq!(
+            pending.entities.get("foo").unwrap(),
+            &Rc::from(['b', 'a', 'r'])
+        );
+    }
+
+    #[test]
+    fn scan_entity_declaration_bytes_malformed_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" 1foo \"bar\">rest");
+        let mut pending = PendingDecls::default();
+        assert!(s.scan_entity_declaration_bytes(0, &mut pending).is_err());
+    }
+
+    #[test]
+    fn entity_declaration_matches_char_path() {
+        for input in [
+            " foo \"bar\">rest",
+            " % foo \"bar\">rest",
+            " foo SYSTEM \"sys.ent\">rest",
+            " foo SYSTEM \"sys.bin\" NDATA gif>rest",
+        ] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let mut pending_b = PendingDecls::default();
+            let br = sb.scan_entity_declaration_bytes(0, &mut pending_b).unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let mut pending_c = PendingDecls::default();
+            let cr = sc.scan_entity_declaration(0, &mut pending_c).unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(pending_b.entities, pending_c.entities);
+            assert_eq!(pending_b.param_entities, pending_c.param_entities);
+            assert_eq!(pending_b.external_names, pending_c.external_names);
+        }
+    }
+
+    // ===== scan_enumeration_list_bytes =====
+
+    #[test]
+    fn scan_enumeration_list_bytes_basic() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"(a|b|c)rest");
+        let r = s.scan_enumeration_list_bytes(0, false).unwrap();
+        assert!(r.is_some());
+        assert_eq!(
+            s.last_enumeration_values,
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn scan_enumeration_list_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"(a|b");
+        assert_eq!(s.scan_enumeration_list_bytes(0, false).unwrap(), None);
+
+        s.append_bytes(b"|c)rest");
+        let r = s.scan_enumeration_list_bytes(0, false).unwrap();
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn scan_enumeration_list_bytes_malformed_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"(a|)rest");
+        assert!(s.scan_enumeration_list_bytes(0, false).is_err());
+    }
+
+    #[test]
+    fn enumeration_list_matches_char_path() {
+        for input in ["(a|b|c)rest", "(only)rest"] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let br = sb.scan_enumeration_list_bytes(0, false).unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let cr = sc.scan_enumeration_list(0, false).unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(sb.last_enumeration_values, sc.last_enumeration_values);
+        }
+    }
+
+    // ===== splice_into_buf_bytes / splice_pe_reference_at_bytes =====
+
+    #[test]
+    fn splice_pe_reference_at_bytes_grows_buffer() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"before %foo; after");
+        let mut pending = PendingDecls::default();
+        let p = 7; // position of '%'
+        let new_pos = s.splice_pe_reference_at_bytes(p, &mut pending, false).unwrap();
+        assert_eq!(new_pos, p);
+        let text = std::str::from_utf8(&s.buf.as_bytes()[..s.limit]).unwrap();
+        assert_eq!(text, "before  bar  after");
+    }
+
+    #[test]
+    fn splice_pe_reference_at_bytes_shrinks_buffer() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("longname".to_string(), Rc::from(['x']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"before %longname; after");
+        let mut pending = PendingDecls::default();
+        let p = 7; // position of '%'
+        s.splice_pe_reference_at_bytes(p, &mut pending, false).unwrap();
+        let text = std::str::from_utf8(&s.buf.as_bytes()[..s.limit]).unwrap();
+        assert_eq!(text, "before  x  after");
+    }
+
+    #[test]
+    fn skip_whitespace_in_declaration_bytes_expands_pe_as_separator() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("ws".to_string(), Rc::from([]));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"%ws;name");
+        let mut pending = PendingDecls::default();
+        let p = s
+            .skip_whitespace_in_declaration_bytes(0, &mut pending, false)
+            .unwrap();
+        assert_eq!(&s.buf.as_bytes()[p..p + 4], b"name");
+    }
+
+    // ===== scan_element_declaration_bytes =====
+
+    #[test]
+    fn scan_element_declaration_bytes_empty() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo EMPTY>rest");
+        let mut pending = PendingDecls::default();
+        let r = s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(decl.content_type, crate::dtd::ContentType::Empty);
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_any() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo ANY>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(decl.content_type, crate::dtd::ContentType::Any);
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_mixed_pcdata_only() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo (#PCDATA)>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(decl.content_type, crate::dtd::ContentType::Mixed);
+        assert_eq!(decl.content_model.as_ref().unwrap().to_string(), "(#PCDATA)");
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_mixed_with_elements() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo (#PCDATA|a|b)*>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(
+            decl.content_model.as_ref().unwrap().to_string(),
+            "(#PCDATA | a | b)*"
+        );
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_sequence_and_choice_with_occurrence() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo (a,(b|c)?,d+)*>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(
+            decl.content_model.as_ref().unwrap().to_string(),
+            "(a, (b | c)?, d+)*"
+        );
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo (a,b");
+        let mut pending = PendingDecls::default();
+        assert_eq!(
+            s.scan_element_declaration_bytes(0, &mut pending).unwrap(),
+            None
+        );
+
+        s.append_bytes(b")>rest");
+        let r = s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_malformed_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" 1foo EMPTY>rest");
+        let mut pending = PendingDecls::default();
+        assert!(s.scan_element_declaration_bytes(0, &mut pending).is_err());
+    }
+
+    #[test]
+    fn scan_element_declaration_bytes_pe_reference_inside_content_model() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.parsing_external_content = true;
+        s.parameter_entities
+            .insert("children".to_string(), Rc::from(['a', ',', 'b']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo (%children;)>rest");
+        let mut pending = PendingDecls::default();
+        let r = s.scan_element_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+        let decl = s.dtd_model.get_element_declaration("foo").unwrap();
+        assert_eq!(decl.content_model.as_ref().unwrap().to_string(), "(a, b)");
+    }
+
+    #[test]
+    fn element_declaration_matches_char_path() {
+        for input in [
+            " foo EMPTY>rest",
+            " foo ANY>rest",
+            " foo (#PCDATA)>rest",
+            " foo (#PCDATA|a|b)*>rest",
+            " foo (a,(b|c)?,d+)*>rest",
+        ] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let mut pending_b = PendingDecls::default();
+            let br = sb.scan_element_declaration_bytes(0, &mut pending_b).unwrap();
+            let model_b = sb
+                .dtd_model
+                .get_element_declaration("foo")
+                .unwrap()
+                .content_model
+                .as_ref()
+                .map(|m| m.to_string());
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let mut pending_c = PendingDecls::default();
+            let cr = sc.scan_element_declaration(0, &mut pending_c).unwrap();
+            let model_c = sc
+                .dtd_model
+                .get_element_declaration("foo")
+                .unwrap()
+                .content_model
+                .as_ref()
+                .map(|m| m.to_string());
+
+            assert_eq!(br, cr);
+            assert_eq!(model_b, model_c);
+        }
+    }
+
+    // ===== scan_attlist_declaration_bytes =====
+
+    #[test]
+    fn scan_attlist_declaration_bytes_cdata_implied() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar CDATA #IMPLIED>rest");
+        let mut pending = PendingDecls::default();
+        let r = s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+        let attrs = s.dtd_model.get_attributes("foo").unwrap();
+        let (name, def) = &attrs[0];
+        assert_eq!(name, "bar");
+        assert_eq!(def.attr_type, "CDATA");
+        assert_eq!(def.mode, crate::dtd::Mode::Implied);
+        assert_eq!(def.default_value, None);
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_fixed_default_with_entity_ref() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar CDATA #FIXED \"x&amp;y\">rest");
+        let mut pending = PendingDecls::default();
+        s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        let attrs = s.dtd_model.get_attributes("foo").unwrap();
+        let (_, def) = &attrs[0];
+        assert_eq!(def.mode, crate::dtd::Mode::Fixed);
+        assert_eq!(def.default_value, Some("x&amp;y".to_string()));
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_enumeration() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar (a|b|c) \"a\">rest");
+        let mut pending = PendingDecls::default();
+        s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        let attrs = s.dtd_model.get_attributes("foo").unwrap();
+        let (_, def) = &attrs[0];
+        assert_eq!(def.attr_type, "ENUMERATION");
+        assert_eq!(
+            def.enumeration,
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        assert_eq!(def.default_value, Some("a".to_string()));
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_notation_enumeration() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar NOTATION (gif|jpeg) #REQUIRED>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        let attrs = s.dtd_model.get_attributes("foo").unwrap();
+        let (_, def) = &attrs[0];
+        assert_eq!(def.attr_type, "NOTATION");
+        assert_eq!(
+            def.enumeration,
+            Some(vec!["gif".to_string(), "jpeg".to_string()])
+        );
+        assert_eq!(def.mode, crate::dtd::Mode::Required);
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_multiple_attributes() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo a CDATA #IMPLIED b CDATA #REQUIRED>rest");
+        let mut pending = PendingDecls::default();
+        s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        let attrs = s.dtd_model.get_attributes("foo").unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].0, "a");
+        assert_eq!(attrs[1].0, "b");
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_needs_more() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar CDATA #IMP");
+        let mut pending = PendingDecls::default();
+        assert_eq!(
+            s.scan_attlist_declaration_bytes(0, &mut pending).unwrap(),
+            None
+        );
+
+        s.append_bytes(b"LIED>rest");
+        let r = s.scan_attlist_declaration_bytes(0, &mut pending).unwrap();
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn scan_attlist_declaration_bytes_unrecognised_type_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b" foo bar BOGUS #IMPLIED>rest");
+        let mut pending = PendingDecls::default();
+        assert!(s.scan_attlist_declaration_bytes(0, &mut pending).is_err());
+    }
+
+    #[test]
+    fn attlist_declaration_matches_char_path() {
+        for input in [
+            " foo bar CDATA #IMPLIED>rest",
+            " foo bar CDATA #FIXED \"x&amp;y\">rest",
+            " foo bar (a|b|c) \"a\">rest",
+            " foo bar NOTATION (gif|jpeg) #REQUIRED>rest",
+            " foo a CDATA #IMPLIED b CDATA #REQUIRED>rest",
+        ] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let mut pending_b = PendingDecls::default();
+            let br = sb.scan_attlist_declaration_bytes(0, &mut pending_b).unwrap();
+            let attrs_b: Vec<(String, String, crate::dtd::Mode, Option<String>, Option<Vec<String>>)> = sb
+                .dtd_model
+                .get_attributes("foo")
+                .map(|list| {
+                    list.iter()
+                        .map(|(n, d)| {
+                            (
+                                n.clone(),
+                                d.attr_type.clone(),
+                                d.mode,
+                                d.default_value.clone(),
+                                d.enumeration.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let mut pending_c = PendingDecls::default();
+            let cr = sc.scan_attlist_declaration(0, &mut pending_c).unwrap();
+            let attrs_c: Vec<(String, String, crate::dtd::Mode, Option<String>, Option<Vec<String>>)> = sc
+                .dtd_model
+                .get_attributes("foo")
+                .map(|list| {
+                    list.iter()
+                        .map(|(n, d)| {
+                            (
+                                n.clone(),
+                                d.attr_type.clone(),
+                                d.mode,
+                                d.default_value.clone(),
+                                d.enumeration.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            assert_eq!(br, cr);
+            assert_eq!(attrs_b, attrs_c);
+        }
+    }
+
+    // ===== scan_doctype_bytes / scan_doctype_subset_inner_bytes =====
+
+    fn make_scanner_skip_mode(handler: &mut dyn XmlHandler) -> Scanner<'_> {
+        let mut features = FeatureSet::default();
+        features.doctype_handling = crate::features::DoctypeHandling::Skip;
+        let settings = features.scanner_settings();
+        Scanner::new(handler, false, None, None, None, false, true, settings, false).unwrap()
+    }
+
+    #[test]
+    fn scan_doctype_bytes_no_internal_subset() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo>rest");
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.doctype_seen);
+        assert_eq!(s.doctype_name, Some("foo".to_string()));
+        let text = std::str::from_utf8(&s.buf.as_bytes()[s.pos..s.limit]).unwrap();
+        assert_eq!(text, "rest");
+    }
+
+    #[test]
+    fn scan_doctype_bytes_internal_subset_all_declaration_kinds() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(
+            b"<!DOCTYPE foo [\n\
+              <!ELEMENT foo (bar)>\n\
+              <!ATTLIST foo id ID #IMPLIED>\n\
+              <!ENTITY amp2 \"&amp;\">\n\
+              <!NOTATION png SYSTEM \"image/png\">\n\
+              ]>rest",
+        );
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_some());
+        assert!(s.dtd_model.get_attributes("foo").is_some());
+        // Entity references inside an <!ENTITY> value literal are
+        // preserved literally, not resolved (only character references
+        // resolve immediately) — see quoted_literal_with_char_refs_bytes_
+        // preserves_entity_ref_literally.
+        assert_eq!(
+            s.general_entities.get("amp2").unwrap(),
+            &Rc::from(['&', 'a', 'm', 'p', ';'])
+        );
+        assert!(s.declared_notations.contains("png"));
+    }
+
+    #[test]
+    fn scan_doctype_bytes_internal_subset_with_comment_and_pi() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo [<!--c--><?pi d?><!ELEMENT foo EMPTY>]>rest");
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_some());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_pe_reference_expands_to_full_declaration() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(
+            b"<!DOCTYPE foo [<!ENTITY % decl \"<!ELEMENT bar EMPTY>\">%decl;]>rest",
+        );
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("bar").is_some());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_pe_reference_expands_to_include_section() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(
+            b"<!DOCTYPE foo [<!ENTITY % sect \"<![INCLUDE[<!ELEMENT baz EMPTY>]]>\">%sect;]>rest",
+        );
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("baz").is_some());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_pe_reference_expands_to_ignore_section() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(
+            b"<!DOCTYPE foo [<!ENTITY % sect2 \"<![IGNORE[<!ELEMENT qux EMPTY>]]>\">%sect2;]>rest",
+        );
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("qux").is_none());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_needs_more_mid_subset() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo [<!ELEMENT foo EM");
+        assert!(!s.scan_doctype_bytes(0).unwrap());
+
+        // append_bytes compacts the buffer (advances past already-consumed
+        // bytes), so position 0 is no longer the start of the DOCTYPE
+        // declaration — resumption must continue via
+        // scan_doctype_subset_bytes() from self.pos, exactly like the
+        // real dispatcher's `in_doctype` branch does, not by re-entering
+        // scan_doctype_bytes at a stale tag_start.
+        s.append_bytes(b"PTY>]>rest");
+        let r = s.scan_doctype_subset_bytes().unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_some());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_only_one_allowed_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.doctype_seen = true;
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo>rest");
+        assert!(s.scan_doctype_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_malformed_is_error() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE 1foo>rest");
+        assert!(s.scan_doctype_bytes(0).is_err());
+    }
+
+    #[test]
+    fn scan_doctype_bytes_skip_mode_ignores_declarations() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner_skip_mode(&mut app);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo [<!ELEMENT foo (bar)><!--c--><?pi d?>]>rest");
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_none());
+        assert!(s.doctype_seen);
+    }
+
+    #[test]
+    fn scan_doctype_bytes_skip_mode_needs_more_mid_skipped_declaration() {
+        let mut app = DefaultHandler;
+        let mut s = make_scanner_skip_mode(&mut app);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo [<!ELEMENT foo (b");
+        assert!(!s.scan_doctype_bytes(0).unwrap());
+
+        // Same buffer-compaction reasoning as the Process-mode test above;
+        // resume via skip_doctype_subset_inner_bytes() directly.
+        s.append_bytes(b"ar)>]>rest");
+        let r = s.skip_doctype_subset_inner_bytes().unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_none());
+    }
+
+    #[test]
+    fn doctype_matches_char_path() {
+        for input in [
+            "<!DOCTYPE foo>rest",
+            "<!DOCTYPE foo [<!ELEMENT foo (bar)><!ATTLIST foo id ID #IMPLIED><!ENTITY amp2 \"&amp;\"><!NOTATION png SYSTEM \"image/png\">]>rest",
+            "<!DOCTYPE foo [<!ENTITY % decl \"<!ELEMENT bar EMPTY>\">%decl;]>rest",
+        ] {
+            let mut app_bytes = DefaultHandler;
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            let br = sb.scan_doctype_bytes(0).unwrap();
+
+            let mut app_chars = DefaultHandler;
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            let cr = sc.scan_doctype(0).unwrap();
+
+            assert_eq!(br, cr);
+            assert_eq!(sb.doctype_name, sc.doctype_name);
+            assert_eq!(sb.general_entities, sc.general_entities);
+            assert_eq!(
+                sb.dtd_model.get_element_declaration("foo").is_some(),
+                sc.dtd_model.get_element_declaration("foo").is_some()
+            );
+        }
+    }
+
+    // ===== finish_doctype_external_subset / fetch_external_resource =====
+    //
+    // Neither needed a byte-native port at all: `fetch_external_resource`
+    // fetches raw bytes via an EntityResolver/filesystem and decodes them
+    // into a fresh Vec<char>, never touching self.buf; `parse_external_subset`
+    // always parses that fetched content through its own temporary
+    // Vec<char> swap, regardless of what representation the live scanner
+    // is in. scan_doctype_bytes already calls finish_doctype_external_subset
+    // unchanged -- this test just confirms that wiring actually resolves
+    // and parses an external subset end-to-end from the byte path.
+
+    struct StaticResolver {
+        content: &'static [u8],
+    }
+
+    impl crate::entity::EntityResolver for StaticResolver {
+        fn resolve(
+            &mut self,
+            _public_id: Option<&str>,
+            _system_id: &str,
+            _base_uri: Option<&str>,
+        ) -> ParseResult<Option<crate::entity::ResolvedEntity>> {
+            Ok(Some(crate::entity::ResolvedEntity::new(self.content)))
+        }
+    }
+
+    #[test]
+    fn scan_doctype_bytes_fetches_and_parses_external_subset() {
+        let mut app = DefaultHandler;
+        let mut features = FeatureSet::default();
+        features.external_parameter_entities = true;
+        features.access_external_dtd = "all".to_string();
+        let settings = features.scanner_settings();
+        let resolver = StaticResolver {
+            content: b"<!ELEMENT foo (bar)>",
+        };
+        let mut s = Scanner::new(
+            &mut app,
+            false,
+            Some(Box::new(resolver)),
+            None,
+            None,
+            false,
+            true,
+            settings,
+            false,
+        )
+        .unwrap();
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<!DOCTYPE foo SYSTEM \"ext.dtd\">rest");
+        let r = s.scan_doctype_bytes(0).unwrap();
+        assert!(r);
+        assert!(s.dtd_model.get_element_declaration("foo").is_some());
+    }
+
+    // ===== scan_bytes: full top-level dispatch loop =====
+    //
+    // These are the first genuinely end-to-end tests in this exploration —
+    // a full document, or a full recursive entity expansion, driven start
+    // to finish through scan_bytes() alone, exercising every byte-native
+    // scanner built across this whole session together.
+
+    fn characters_text(events: &[String]) -> String {
+        events
+            .iter()
+            .filter_map(|e| {
+                let rest = e.strip_prefix("characters(\"")?;
+                let end = rest.find("\",")?;
+                Some(rest[..end].to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_bytes_full_simple_document() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<root>hello</root>");
+        s.scan_bytes().unwrap();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "start_element(root)".to_string(),
+                "end_attributes".to_string(),
+                "characters(\"hello\",false,true)".to_string(),
+                "end_element".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_bytes_full_document_with_attributes_comment_pi_cdata() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<root a=\"x&amp;y\"><!--c--><?pi d?><![CDATA[raw]]>tail</root>");
+        s.scan_bytes().unwrap();
+        let ev = events.borrow();
+        assert_eq!(ev[0], "start_element(root)");
+        assert!(ev.contains(&"start_attribute(a,CDATA,false,true)".to_string()));
+        assert!(ev.contains(&"attr_value(\"x\",false)".to_string()));
+        assert!(ev.contains(&"attr_value(\"&\",false)".to_string()));
+        assert!(ev.contains(&"attr_value(\"y\",true)".to_string()));
+        assert!(ev.contains(&"start_comment".to_string()));
+        assert!(ev.contains(&"comment_data(\"c\",true)".to_string()));
+        assert!(ev.contains(&"pi_target(pi)".to_string()));
+        assert!(ev.contains(&"pi_data(\"d\",true)".to_string()));
+        assert!(ev.contains(&"start_cdata".to_string()));
+        assert!(ev.contains(&"characters(\"raw\",false,true)".to_string()));
+        assert!(ev.contains(&"end_cdata".to_string()));
+        assert!(ev.contains(&"characters(\"tail\",false,true)".to_string()));
+        assert_eq!(ev.last().unwrap(), "end_element");
+    }
+
+    #[test]
+    fn scan_bytes_expands_general_entity_in_content() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.general_entities
+            .insert("foo".to_string(), Rc::from(['b', 'a', 'r']));
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<root>pre&foo;post</root>");
+        s.scan_bytes().unwrap();
+        let ev = events.borrow();
+        assert!(ev.contains(&"start_entity(foo)".to_string()));
+        assert!(ev.contains(&"end_entity(foo)".to_string()));
+        let start_entity_idx = ev.iter().position(|e| e == "start_entity(foo)").unwrap();
+        let end_entity_idx = ev.iter().position(|e| e == "end_entity(foo)").unwrap();
+        assert!(start_entity_idx < end_entity_idx);
+        assert_eq!(characters_text(&ev), "prebarpost");
+        assert_eq!(ev.last().unwrap(), "end_element");
+    }
+
+    #[test]
+    fn scan_bytes_expands_general_entity_with_nested_markup_in_content() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.general_entities.insert(
+            "elem".to_string(),
+            Rc::from("<child>x</child>".chars().collect::<Vec<char>>()),
+        );
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<root>a&elem;b</root>");
+        s.scan_bytes().unwrap();
+        let ev = events.borrow();
+        let start_entity_idx = ev.iter().position(|e| e == "start_entity(elem)").unwrap();
+        let start_child_idx = ev
+            .iter()
+            .position(|e| e == "start_element(child)")
+            .unwrap();
+        let end_entity_idx = ev.iter().position(|e| e == "end_entity(elem)").unwrap();
+        assert!(start_entity_idx < start_child_idx);
+        assert!(start_child_idx < end_entity_idx);
+        assert_eq!(characters_text(&ev), "axb");
+        // Full document parsed to a clean close: <child> opened and closed
+        // strictly within the entity's replacement text, and </root>
+        // closed the root — no unbalanced element boundary leaked across
+        // the entity-expansion recursion.
+        assert!(s.element_stack.is_empty());
+        assert_eq!(ev.last().unwrap(), "end_element");
+    }
+
+    #[test]
+    fn scan_bytes_needs_more_across_full_document() {
+        let mut app = TagRecordingHandler::default();
+        let events = Rc::clone(&app.events);
+        let mut s = make_scanner(&mut app, false);
+        s.switch_to_bytes_mode();
+        s.append_bytes(b"<root a=\"1");
+        s.scan_bytes().unwrap();
+        assert!(!events.borrow().contains(&"end_attributes".to_string()));
+
+        s.append_bytes(b"\">hel");
+        s.scan_bytes().unwrap();
+
+        s.append_bytes(b"lo</root>");
+        s.scan_bytes().unwrap();
+
+        let ev = events.borrow();
+        assert_eq!(ev[0], "start_element(root)");
+        assert!(ev.contains(&"end_attributes".to_string()));
+        assert_eq!(characters_text(&ev), "hello");
+        assert_eq!(ev.last().unwrap(), "end_element");
+    }
+
+    #[test]
+    fn scan_bytes_matches_char_path_on_full_document() {
+        for input in [
+            "<root>hello</root>",
+            "<root a=\"x&amp;y\"><!--c--><?pi d?>text</root>",
+        ] {
+            let mut app_bytes = TagRecordingHandler::default();
+            let bytes_events = Rc::clone(&app_bytes.events);
+            let mut sb = make_scanner(&mut app_bytes, false);
+            sb.switch_to_bytes_mode();
+            sb.append_bytes(input.as_bytes());
+            sb.scan_bytes().unwrap();
+
+            let mut app_chars = TagRecordingHandler::default();
+            let char_events = Rc::clone(&app_chars.events);
+            let mut sc = make_scanner(&mut app_chars, false);
+            sc.append(input);
+            sc.scan().unwrap();
+
+            assert_eq!(*bytes_events.borrow(), *char_events.borrow());
+        }
+    }
 }
