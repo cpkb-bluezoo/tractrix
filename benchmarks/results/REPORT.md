@@ -1,6 +1,6 @@
 # Benchmark results
 
-Generated: 2026-08-06T06:06:52Z
+Generated: 2026-08-06T06:21:05Z
 
 Versions: Expat 2.8.2 · libxml2 2.15.3 · quick-xml 0.39.0 · chunk size 32768 bytes · 10 iterations (first discarded as warm-up)
 
@@ -17,8 +17,8 @@ Corpus: 1206 well-formed files (Tier 1) / 417 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|
-| quick-xml | ns | no-op sink | 0.0114 | 280.7 | 6.8 | **3** (see below) |
-| tractrix | skip | no-op sink (RecordingHandler — tracks error() only) | 0.0245 | 131.0 | 8.6 | **1** (see below) |
+| quick-xml | ns | no-op sink | 0.0108 | 298.1 | 6.7 | **3** (see below) |
+| tractrix | skip | no-op sink (RecordingHandler — tracks error() only) | 0.0231 | 139.0 | 8.2 | **1** (see below) |
 
 **expat vs. tractrix** — Expat parses the DTD (entities, attribute defaults) but has no validating mode — matched against tractrix's `Process`/non-validating config (tier 2).
 
@@ -26,8 +26,8 @@ Corpus: 1206 well-formed files (Tier 1) / 417 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|
-| expat | ns | no-op sink | 0.0340 | 94.4 | 6.4 | **2** (see below) |
-| tractrix | ns | no-op sink (RecordingHandler — tracks error() only) | 0.0278 | 115.6 | 8.7 | 0 |
+| expat | ns | no-op sink | 0.0323 | 99.3 | 6.3 | **2** (see below) |
+| tractrix | ns | no-op sink (RecordingHandler — tracks error() only) | 0.0262 | 122.4 | 8.4 | 0 |
 
 **libxml2 vs. tractrix** — libxml2's SAX2 interface does full DTD validation — matched against tractrix's `Process`/validating config (tier 3).
 
@@ -35,8 +35,8 @@ Corpus: 1206 well-formed files (Tier 1) / 417 DTD-validating files (Tier 2), poo
 
 | Parser | Config | Handler | Median (s) | MB/s | Peak RSS (MB) | Errors |
 |---|---|---|---:|---:|---:|---:|
-| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 0.0088 | 11.0 | 4.0 | **2** (see below) |
-| tractrix | ns+dtd | no-op sink (RecordingHandler — tracks error() only) | 0.0172 | 5.6 | 6.0 | 0 |
+| libxml2 | ns+dtd | default SAX2 (tree-building — required for validation, see harness/libxml2/bench_libxml2.c) | 0.0078 | 12.4 | 3.7 | **2** (see below) |
+| tractrix | ns+dtd | no-op sink (RecordingHandler — tracks error() only) | 0.0095 | 10.2 | 5.9 | 0 |
 
 
 ## Pathological case (single huge token)
@@ -45,14 +45,14 @@ One element with a single ~64MB attribute value / CDATA run, fed in the same 327
 
 | Parser | Config | Document | Peak RSS (MB) | Time (s) |
 |---|---|---|---:|---:|
-| expat | ns | attribute | 259.8 | 0.5638 |
-| expat | ns | text/CDATA | 65.6 | 0.2415 |
-| libxml2 | ns+dtd | attribute | 259.0 | 0.3430 |
-| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3768 |
-| quick-xml | ns | attribute | 131.7 | 0.0593 |
-| quick-xml | ns | text/CDATA | 131.7 | 0.0130 |
-| tractrix | ns | attribute | 66.1 | 0.1084 |
-| tractrix | ns | text/CDATA | 66.1 | 0.1282 |
+| expat | ns | attribute | 259.8 | 0.5615 |
+| expat | ns | text/CDATA | 65.6 | 0.2402 |
+| libxml2 | ns+dtd | attribute | 259.0 | 0.3489 |
+| libxml2 | ns+dtd | text/CDATA | 259.7 | 0.3514 |
+| quick-xml | ns | attribute | 131.7 | 0.0625 |
+| quick-xml | ns | text/CDATA | 131.7 | 0.0137 |
+| tractrix | ns | attribute | 66.2 | 0.1082 |
+| tractrix | ns | text/CDATA | 66.2 | 0.1244 |
 
 ## Errors
 

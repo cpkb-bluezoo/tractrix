@@ -8400,25 +8400,22 @@ impl<'a> Scanner<'a> {
                 self.buf.as_chars_mut().resize(newcap, '\u{0}');
             }
         }
-        // Move tail.
+        // Move tail. `copy_within` (`ptr::copy`/memmove under the hood)
+        // handles the overlapping regions in either direction correctly on
+        // its own — profiling showed the old hand-rolled element-by-element
+        // loop (through `ScanBuffer`'s `Index`/`IndexMut`) as the single
+        // largest cost in DTD-validating parses, dwarfing every other
+        // function in the profile (see git history for the numbers).
         if new_span != old_span {
             let tail_len = self.limit - end;
-            if delta > 0 {
-                // shift right, back to front
-                for i in (0..tail_len).rev() {
-                    self.buf[start + new_span + i] = self.buf[end + i];
-                }
-            } else {
-                for i in 0..tail_len {
-                    self.buf[start + new_span + i] = self.buf[end + i];
-                }
-            }
+            self.buf
+                .as_chars_mut()
+                .copy_within(end..end + tail_len, start + new_span);
         }
-        self.buf[start] = ' ';
-        for (i, c) in replacement.iter().enumerate() {
-            self.buf[start + 1 + i] = *c;
-        }
-        self.buf[start + 1 + replacement.len()] = ' ';
+        let chars = self.buf.as_chars_mut();
+        chars[start] = ' ';
+        chars[start + 1..start + 1 + replacement.len()].copy_from_slice(replacement);
+        chars[start + 1 + replacement.len()] = ' ';
         self.limit = (self.limit as i64 + delta) as usize;
         self.last_splice_end = (start + new_span) as i64;
         self.saw_splice_since_declaration_start = true;
@@ -8470,19 +8467,13 @@ impl<'a> Scanner<'a> {
                 self.buf.as_bytes_mut().resize(newcap, 0);
             }
         }
-        // Move tail.
+        // Move tail — see the char-path `splice_into_buf` for why this is
+        // `copy_within` (memmove) rather than an element-by-element loop.
         if new_span != old_span {
             let tail_len = self.limit - end;
-            if delta > 0 {
-                // shift right, back to front
-                for i in (0..tail_len).rev() {
-                    self.buf.as_bytes_mut()[start + new_span + i] = self.buf.as_bytes()[end + i];
-                }
-            } else {
-                for i in 0..tail_len {
-                    self.buf.as_bytes_mut()[start + new_span + i] = self.buf.as_bytes()[end + i];
-                }
-            }
+            self.buf
+                .as_bytes_mut()
+                .copy_within(end..end + tail_len, start + new_span);
         }
         self.buf.as_bytes_mut()[start] = b' ';
         self.buf.as_bytes_mut()[start + 1..start + 1 + encoded.len()].copy_from_slice(encoded);
