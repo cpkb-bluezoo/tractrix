@@ -64,30 +64,57 @@ def mb(bytes_val):
     return bytes_val / (1024.0 * 1024.0)
 
 
+
+# Each comparison pairs a target parser's DTD-handling tier against the
+# tractrix config with matching capability (see README.md "Feature-parity
+# matrix") — quick-xml never processes DTD contents at all (tier 1, Skip),
+# Expat parses but doesn't validate (tier 2, Process/no validation), libxml2
+# validates (tier 3, Process/validation). Rendering them as one 2-row table
+# per pair, instead of one flat table, makes that head-to-head the point
+# rather than something the reader has to reconstruct by eye.
+THROUGHPUT_COMPARISONS = [
+    ("quick-xml never parses DTD contents at all — matched against tractrix's `Skip` config (tier 1).",
+     ("quick-xml", "ns"), ("tractrix", "skip")),
+    ("Expat parses the DTD (entities, attribute defaults) but has no validating mode — matched against "
+     "tractrix's `Process`/non-validating config (tier 2).",
+     ("expat", "ns"), ("tractrix", "ns")),
+    ("libxml2's SAX2 interface does full DTD validation — matched against tractrix's `Process`/validating "
+     "config (tier 3).",
+     ("libxml2", "ns+dtd"), ("tractrix", "ns+dtd")),
+]
+
+
 def render_throughput_table(results):
-    lines = [
-        "| Parser | Config | Handler | Files | Corpus (MB) | Median (s) | MB/s | Peak RSS (MB) | Errors |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|",
-    ]
-    for r in results:
-        parser = r.get("parser", "?")
-        handler = HANDLER_KIND.get(parser, "?")
-        errors = len(r.get("errors", []))
-        err_note = str(errors) if errors == 0 else f"**{errors}** (see below)"
-        lines.append(
-            "| {parser} | {config} | {handler} | {files} | {corpus_mb:.2f} | {median:.4f} | {mbs:.1f} | {rss:.1f} | {err} |".format(
-                parser=parser,
-                config=r.get("config", "?"),
-                handler=handler,
-                files=r.get("file_count", 0),
-                corpus_mb=mb(r.get("total_bytes", 0)),
-                median=r.get("median_sec", 0.0),
-                mbs=r.get("mb_per_sec", 0.0),
-                rss=mb(r.get("peak_rss_bytes", 0)),
-                err=err_note,
-            )
+    by_key = {(r.get("parser"), r.get("config")): r for r in results}
+    parts = []
+    for note, left_key, right_key in THROUGHPUT_COMPARISONS:
+        left = by_key.get(left_key)
+        right = by_key.get(right_key)
+        if left is None or right is None:
+            continue
+        parts.append(f"\n**{left_key[0]} vs. tractrix** — {note}\n")
+        parts.append(
+            f"{left['file_count']} files, {mb(left.get('total_bytes', 0)):.2f} MB corpus.\n"
         )
-    return "\n".join(lines)
+        parts.append("| Parser | Config | Handler | Median (s) | MB/s | Peak RSS (MB) | Errors |")
+        parts.append("|---|---|---|---:|---:|---:|---:|")
+        for r in (left, right):
+            parser = r.get("parser", "?")
+            handler = HANDLER_KIND.get(parser, "?")
+            errors = len(r.get("errors", []))
+            err_note = str(errors) if errors == 0 else f"**{errors}** (see below)"
+            parts.append(
+                "| {parser} | {config} | {handler} | {median:.4f} | {mbs:.1f} | {rss:.1f} | {err} |".format(
+                    parser=parser,
+                    config=r.get("config", "?"),
+                    handler=handler,
+                    median=r.get("median_sec", 0.0),
+                    mbs=r.get("mb_per_sec", 0.0),
+                    rss=mb(r.get("peak_rss_bytes", 0)),
+                    err=err_note,
+                )
+            )
+    return "\n".join(parts)
 
 
 def render_pathological_table(results):
