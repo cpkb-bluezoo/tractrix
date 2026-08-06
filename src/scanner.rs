@@ -234,6 +234,34 @@ pub struct Scanner<'a> {
     doctype_system_id: Option<String>,
 
     general_entities: HashMap<String, Rc<[char]>>,
+    /// Memoizes `expand_general_entity_in_attribute_value`'s result per
+    /// entity name: a general entity's normalized attribute-value text
+    /// (nested references resolved, whitespace collapsed) is identical on
+    /// every reference, so recomputing it from scratch each time is pure
+    /// waste — for an entity nested N levels deep, that waste compounds
+    /// multiplicatively with the number of references at the outermost
+    /// level. `check_entity_referenceable` (including its expansion-count
+    /// limit and recursive-reference check) still runs on every reference,
+    /// cached or not — only the expensive recursive rebuild is skipped.
+    attribute_entity_cache: HashMap<String, Rc<str>>,
+    /// Memoizes whether a general entity's content-context expansion
+    /// (nested references resolved, but NOT character-legality-checked --
+    /// the real recursive scan still does that, over this precomputed
+    /// text instead of the raw declared text) can be fully flattened to
+    /// plain text ahead of time. `None` means "contains markup (or is
+    /// external, or otherwise not flattenable) -- always use the real
+    /// per-reference recursive scan for this entity." Only populated for
+    /// `!self.xml11` documents (see `flatten_content_entity_cached`'s doc
+    /// comment for why XML 1.1 opts out).
+    content_entity_cache: HashMap<String, Option<Rc<[char]>>>,
+    /// Byte-path counterpart to `content_entity_cache`: caches the same
+    /// flattened text pre-*encoded* to UTF-8, so a byte-mode document
+    /// referencing the same entity repeatedly skips the chars -> UTF-8
+    /// encode step too, not just the nested-reference resolution that
+    /// `content_entity_cache` already avoids redoing. Built lazily off of
+    /// `content_entity_cache` (encoded once, on first byte-path use of a
+    /// given name), not populated in lockstep with it.
+    content_entity_byte_cache: HashMap<String, Option<Rc<str>>>,
     external_entity_names: HashMap<String, ExtEntity>,
     parameter_entities: HashMap<String, Rc<[char]>>,
     parameter_entity_external_ids: HashMap<String, ExtPe>,
@@ -628,6 +656,9 @@ impl<'a> Scanner<'a> {
             doctype_public_id: None,
             doctype_system_id: None,
             general_entities: HashMap::new(),
+            attribute_entity_cache: HashMap::new(),
+            content_entity_cache: HashMap::new(),
+            content_entity_byte_cache: HashMap::new(),
             external_entity_names: HashMap::new(),
             parameter_entities: HashMap::new(),
             parameter_entity_external_ids: HashMap::new(),
@@ -752,6 +783,9 @@ impl<'a> Scanner<'a> {
         self.doctype_public_id = None;
         self.doctype_system_id = None;
         self.general_entities.clear();
+        self.attribute_entity_cache.clear();
+        self.content_entity_cache.clear();
+        self.content_entity_byte_cache.clear();
         self.external_entity_names.clear();
         self.parameter_entities.clear();
         self.parameter_entity_external_ids.clear();
@@ -7086,6 +7120,159 @@ impl<'a> Scanner<'a> {
         Ok(true)
     }
 
+    /// Cache-only lookup/build for `name`'s flattened content-context
+    /// text. Assumes the caller has *already* confirmed `name` itself is
+    /// referenceable (the top-level call site in
+    /// `expand_general_entity_in_content`(`_bytes`) already does this
+    /// before reaching here) — nested names discovered while walking the
+    /// text go through `flatten_content_entity_nested` instead, which
+    /// does check, so every nested reference still gets exactly one
+    /// real WFC/VC check and one `check_entity_expansion_limit` count,
+    /// just no longer once *per occurrence* of the outer entity.
+    fn flatten_content_entity_cached(&mut self, name: &str) -> ParseResult<Option<Rc<[char]>>> {
+        if self.xml11 {
+            // allow_restricted_char_in_content is tracked and applied per
+            // entity, specifically while scanning THAT entity's own
+            // declared text; a single flattened blob loses that per-entity
+            // context. XML 1.1 is rare enough in practice that skipping
+            // flattening entirely for it, rather than reasoning through
+            // the interaction, is the safer trade.
+            return Ok(None);
+        }
+        if let Some(cached) = self.content_entity_cache.get(name) {
+            return Ok(cached.clone());
+        }
+        // Cycle guard, independent of (but reusing) the real scan-time
+        // recursion stack: this walk recurses eagerly, ahead of any
+        // actual scanning, so it needs its own protection against
+        // self-referential or mutually-recursive entities. A genuine
+        // cycle just falls back to the real recursive scan, which
+        // reports it properly via this same stack at scan time.
+        if self.entity_expansion_stack.iter().any(|n| n == name) {
+            return Ok(None);
+        }
+        let declared = match self.general_entities.get(name) {
+            Some(v) => v.clone(),
+            None => {
+                self.content_entity_cache.insert(name.to_string(), None);
+                return Ok(None);
+            }
+        };
+        self.entity_expansion_stack.push(name.to_string());
+        let result = self.flatten_content_text(&declared);
+        self.entity_expansion_stack.pop();
+        let result = result?;
+        self.content_entity_cache.insert(name.to_string(), result.clone());
+        Ok(result)
+    }
+
+    /// Exploratory (explore/utf8-byte-path): byte-path counterpart to
+    /// `flatten_content_entity_cached`. Encodes the (already memoized)
+    /// flattened `[char]` text to UTF-8 exactly once per entity name and
+    /// caches that too, so a byte-mode document referencing the same
+    /// entity repeatedly skips the chars -> UTF-8 encode step as well,
+    /// not just the nested-reference resolution.
+    #[allow(dead_code)]
+    fn flatten_content_entity_bytes_cached(&mut self, name: &str) -> ParseResult<Option<Rc<str>>> {
+        if let Some(cached) = self.content_entity_byte_cache.get(name) {
+            return Ok(cached.clone());
+        }
+        let result = self
+            .flatten_content_entity_cached(name)?
+            .map(|chars| Rc::from(chars.iter().collect::<String>().as_str()));
+        self.content_entity_byte_cache.insert(name.to_string(), result.clone());
+        Ok(result)
+    }
+
+    /// Resolves a nested entity reference found while flattening: unlike
+    /// the top-level entry point, nothing has checked referenceability for
+    /// this name yet, so this does so itself — propagating any WFC/VC
+    /// violation as a real error, exactly like the real recursive-scan
+    /// path would if it ever reached this reference directly.
+    fn flatten_content_entity_nested(&mut self, name: &str) -> ParseResult<Option<Rc<[char]>>> {
+        if !self.check_entity_referenceable(name, true)? {
+            return Ok(None);
+        }
+        self.flatten_content_entity_cached(name)
+    }
+
+    /// Walks `text` (an entity's raw declared replacement text), inlining
+    /// *only* nested general-entity references, into plain characters.
+    /// Returns `Ok(None)` the moment anything isn't safely flattenable
+    /// this way.
+    ///
+    /// Deliberately conservative: predefined entities (`&amp;` etc.) and
+    /// numeric character references *always* bail too, not just when they
+    /// resolve to a structurally awkward character. Two independent
+    /// correctness hazards motivate this, both found via the full xmlconf
+    /// run after an earlier, more permissive version of this function:
+    ///
+    /// 1. A resolved `<` or `&` re-enters the flattened buffer as a plain
+    ///    character, but the *real* scan that later runs over this text
+    ///    can't tell "resolved" from "literal" — it would misparse a
+    ///    resolved `<` as real markup (xmltest valid-sa-088: `&lt;foo>`
+    ///    must stay text "<foo>", not become a start tag).
+    /// 2. Character-reference-produced whitespace must always be reported
+    ///    as non-ignorable (errata E15h) — `scan_content`'s handling of a
+    ///    decoded reference hard-codes `ignorable=false` specifically
+    ///    *because* it knows it's looking at a reference, not literal
+    ///    text. Once flattened into a plain character, that provenance is
+    ///    gone, and a plain space would wrongly fall into the normal
+    ///    literal-whitespace path instead.
+    ///
+    /// Nested *general* entities don't have either problem: the real scan
+    /// already treats their replacement text as effectively inlined
+    /// literal text (not reference-produced) for whitespace-ignorability
+    /// purposes, and this function's own literal-vs-`&` handling below
+    /// means a successfully-flattened nested entity can never itself
+    /// contain a resolved `<` or `&` (the same guarantee applies
+    /// recursively). So restricting the fast path to "literal characters
+    /// plus nested general-entity references" is enough to make it
+    /// provably safe, at the cost of not flattening entities that also
+    /// use predefined or numeric references — falling back to the
+    /// existing, already-correct recursive scan for those.
+    fn flatten_content_text(&mut self, text: &[char]) -> ParseResult<Option<Rc<[char]>>> {
+        let len = text.len();
+        let mut out: Vec<char> = Vec::with_capacity(len);
+        let mut q = 0;
+        while q < len {
+            let c = text[q];
+            if c == '<' {
+                return Ok(None);
+            }
+            if c != '&' {
+                out.push(c);
+                q += 1;
+                continue;
+            }
+            let name_start = q + 1;
+            if name_start < len && text[name_start] == '#' {
+                // Numeric character reference: always bail (see doc
+                // comment) rather than trying to determine per-value
+                // whether this particular one would be safe.
+                return Ok(None);
+            }
+            let mut p = name_start;
+            while p < len && is_name_char(text[p]) {
+                p += 1;
+            }
+            if p >= len || p == name_start || text[p] != ';' {
+                return Ok(None);
+            }
+            if match_predefined(text, name_start, p - name_start).is_some() {
+                // Predefined entity: same reasoning as numeric refs above.
+                return Ok(None);
+            }
+            let ref_name: String = text[name_start..p].iter().collect();
+            match self.flatten_content_entity_nested(&ref_name)? {
+                Some(nested) => out.extend(nested.iter().copied()),
+                None => return Ok(None),
+            }
+            q = p + 1;
+        }
+        Ok(Some(Rc::from(out.into_boxed_slice())))
+    }
+
     fn expand_general_entity_in_content(&mut self, name: &str) -> ParseResult<()> {
         if !self.check_entity_referenceable(name, true)? {
             return Ok(());
@@ -7105,10 +7292,22 @@ impl<'a> Scanner<'a> {
             )?;
             replacement_chars = self.strip_declaration(&fetched)?;
         } else {
+            // Try the fast path first: if this entity (and everything
+            // nested inside it) can be fully resolved to plain text ahead
+            // of time, reuse that -- one nested-reference-graph walk
+            // total, memoized, instead of redoing it on every occurrence.
+            // A real, measured hot path: relaxng/good.xml in the
+            // benchmark corpus references one entity ~300 times, each
+            // nested 3 levels deep; unflattened, every single occurrence
+            // redid the whole nested walk from scratch.
+            //
             // self.buf must be a uniquely-owned Vec<char> (see
             // expand_parameter_entity_reference) — a plain slice memcpy
             // from the shared Rc, not a UTF-8 re-decode.
-            replacement_chars = self.general_entities.get(name).unwrap().to_vec();
+            replacement_chars = match self.flatten_content_entity_cached(name)? {
+                Some(flat) => flat.to_vec(),
+                None => self.general_entities.get(name).unwrap().to_vec(),
+            };
         }
 
         self.entity_expansion_stack.push(name.to_string());
@@ -7181,7 +7380,7 @@ impl<'a> Scanner<'a> {
         }
         let external = self.external_entity_names.get(name).cloned();
         self.handler.start_entity(name)?;
-        let replacement_chars: Vec<char>;
+        let replacement_bytes: BytesMut;
         if let Some(ext) = external {
             if !self.settings.external_general_entities {
                 self.handler.end_entity(name)?;
@@ -7189,15 +7388,27 @@ impl<'a> Scanner<'a> {
             }
             let fetched =
                 self.fetch_external_entity(name, ext.public_id.as_deref(), ext.system_id.as_deref())?;
-            replacement_chars = self.strip_declaration(&fetched)?;
+            let stripped = self.strip_declaration(&fetched)?;
+            let encoded: String = stripped.iter().collect();
+            replacement_bytes = BytesMut::from(encoded.as_bytes());
         } else {
-            replacement_chars = self.general_entities.get(name).unwrap().to_vec();
+            // Unlike the char path (which caches flattened `[char]` text
+            // and clones it per use), the byte path caches the flattened
+            // text pre-encoded to UTF-8 too — so a repeat reference skips
+            // straight to a byte copy instead of re-encoding chars ->
+            // UTF-8 on every single occurrence.
+            replacement_bytes = match self.flatten_content_entity_bytes_cached(name)? {
+                Some(flat) => BytesMut::from(flat.as_bytes()),
+                None => {
+                    let raw = self.general_entities.get(name).cloned().unwrap_or_default();
+                    let encoded: String = raw.iter().collect();
+                    BytesMut::from(encoded.as_bytes())
+                }
+            };
         }
 
         self.entity_expansion_stack.push(name.to_string());
-        let encoded: String = replacement_chars.iter().collect();
-        let saved_buf =
-            std::mem::replace(self.buf.as_bytes_mut(), BytesMut::from(encoded.as_bytes()));
+        let saved_buf = std::mem::replace(self.buf.as_bytes_mut(), replacement_bytes);
         let saved_pos = self.pos;
         let saved_limit = self.limit;
         let saved_content_run_open = self.content_run_open;
@@ -7251,8 +7462,25 @@ impl<'a> Scanner<'a> {
     }
 
     fn expand_general_entity_in_attribute_value(&mut self, name: &str) -> ParseResult<String> {
+        // check_entity_referenceable runs unconditionally, cache hit or
+        // not: it's what enforces the recursive-reference check and the
+        // per-reference entity-expansion-count limit, and both need to see
+        // every reference, not just the first (a document that references
+        // the same entity 100,000 times must still hit the limit, even
+        // though each individual expansion is now cheap).
         if !self.check_entity_referenceable(name, false)? {
             return Ok(String::new());
+        }
+        // A cache hit means resolving this entity's normalized attribute
+        // text once already ran the full recursive walk over the DTD's
+        // nested entity graph — reuse that result rather than redoing the
+        // walk. Without this, a document referencing one N-levels-deep
+        // entity M times redoes that whole walk M times, and the walk
+        // itself is already doing repeated work per level, compounding
+        // multiplicatively (a real, measured hot path: see
+        // relaxng/good_attr.xml in the benchmark corpus).
+        if let Some(cached) = self.attribute_entity_cache.get(name) {
+            return Ok(cached.to_string());
         }
         // A refcount bump, not a String clone + re-decode: the replacement
         // text is identical on every reference to this entity, so there's
@@ -7262,6 +7490,10 @@ impl<'a> Scanner<'a> {
         let context = format!("entity \"{name}\"");
         let result = self.resolve_attribute_text(&replacement, &context);
         self.entity_expansion_stack.pop();
+        if let Ok(resolved) = &result {
+            self.attribute_entity_cache
+                .insert(name.to_string(), Rc::from(resolved.as_str()));
+        }
         result
     }
 
