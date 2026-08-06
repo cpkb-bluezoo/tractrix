@@ -732,6 +732,7 @@ impl<'a> Scanner<'a> {
         self.utf8_confirmed = confirmed;
     }
 
+    #[cfg(test)]
     pub(crate) fn is_utf8_confirmed(&self) -> bool {
         self.utf8_confirmed
     }
